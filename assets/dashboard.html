@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>K2 — flight deck</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  body { margin: 0; background: #0b0d10; color: #e6e9ef; }
+  .wrap { display: grid; gap: 10px; padding: 16px; max-width: 1180px; margin: 0 auto; }
+  .row { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 10px; }
+  .card { background: #12151b; border: 1px solid #232833; border-radius: 10px; padding: 12px 14px; }
+  h1 { font-size: 14px; margin: 0 0 2px; color: #8b93a5; letter-spacing: .08em; }
+  .big { font-size: 26px; }
+  .ok { color: #4ade80; } .bad { color: #f87171; } .warn { color: #fbbf24; } .dim { color: #6b7280; }
+  .spark { width: 100%; height: 90px; }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  td { padding: 2px 6px; }
+  button { background: #1b2029; border: 1px solid #2c3442; color: #e6e9ef; padding: 6px 10px;
+           border-radius: 8px; cursor: pointer; font-family: inherit; }
+  button:hover { background: #232a37; }
+  .dot { display:inline-block; width:8px; height:8px; border-radius:99px; margin-right:6px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="row">
+    <div class="card"><h1>THROUGHPUT</h1><div class="big" id="rps">—</div><div class="dim" id="tput">target —</div></div>
+    <div class="card"><h1>p50 / p99</h1><div class="big" id="lat">—</div><div class="dim" id="dlat">—</div></div>
+    <div class="card"><h1>STATUS</h1><div class="big" id="state">—</div><div class="dim" id="runtime">—</div></div>
+  </div>
+  <div class="card">
+    <h1>p99 SPARKLINE (µs)</h1>
+    <svg class="spark" id="svg" viewBox="0 0 600 90" preserveAspectRatio="none"></svg>
+  </div>
+  <div class="row">
+    <div class="card"><h1>STATUS MATRIX</h1><table id="statuses"></table></div>
+    <div class="card"><h1>ERRORS</h1><table id="errors"></table></div>
+    <div class="card">
+      <h1>STRATEGY</h1>
+      <p id="strategy" class="big">—</p>
+      <p>
+        <button onclick="strategy('knee')">[K] Knee</button>
+        <button onclick="strategy('brownout')">[B] Brownout</button>
+        <button onclick="strategy('pulse')">[P] Pulse</button>
+        <button onclick="strategy('manual')">[M] Manual</button>
+      </p>
+      <p>
+        <button onclick="rate('+100')">+100</button>
+        <button onclick="rate('-100')">−100</button>
+        <button onclick="entropy()">[E] Entropy</button>
+        <button class="warn" onclick="drain()">[Q] Drain</button>
+      </p>
+    </div>
+  </div>
+</div>
+<script>
+const $ = id => document.getElementById(id);
+function strategy(k) { fetch('/api/strategy/' + k); }
+function rate(r) { fetch('/api/rate/' + r); }
+function drain() { fetch('/api/drain'); }
+function entropy() { fetch('/api/entropy'); }
+
+function spark(hist) {
+  const svg = $('svg');
+  if (!hist.length) { svg.innerHTML = ''; return; }
+  const pts = hist.map(h => h.p99_ns / 1000);
+  const max = Math.max(...pts, 1);
+  const n = pts.length, W = 600, H = 90, step = W / Math.max(n - 1, 1);
+  let d = 'M0 ' + (H - pts[0] / max * (H - 6) - 3).toFixed(1);
+  pts.forEach((p, i) => { d += ' L' + (i * step).toFixed(1) + ' ' + (H - p / max * (H - 6) - 3).toFixed(1); });
+  svg.innerHTML = `<path d="${d}" fill="none" stroke="#a78bfa" stroke-width="1.6"/>`;
+}
+
+let ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws');
+ws.onmessage = ev => {
+  const s = JSON.parse(ev.data);
+  $('rps').textContent = s.actual_rps.toFixed(0) + '/s';
+  $('tput').textContent = 'target ' + s.target_rate.toFixed(0) + '/s   in-flight ' + s.in_flight;
+  $('lat').textContent = (s.p50_ns/1e6).toFixed(2) + ' / ' + (s.p99_ns/1e6).toFixed(2) + ' ms';
+  const degr = s.trend === 'degrading';
+  $('dlat').innerHTML = '<span class="' + (degr ? 'bad' : 'ok') + '">dLat/dt ' + s.dlat_rel.toFixed(3) + ' (' + (degr ? 'DEGRADING' : 'STABLE') + ')</span>';
+  $('state').innerHTML = '<span class="dot ' + (s.running ? 'ok' : 'warn') + '"></span>' + (s.running ? 'RUNNING' : 'INIT');
+  $('runtime').textContent = 'runtime ' + s.elapsed_s.toFixed(1) + 's — requests ' + s.count_total;
+  $('strategy').textContent = s.strategy;
+  $('statuses').innerHTML = s.statuses.map(([c, n, p]) => `<tr><td>${c}</td><td>${n}</td><td class="dim">${p.toFixed(1)}%</td></tr>`).join('');
+  $('errors').innerHTML = s.errors.length ? s.errors.map(([k, n]) => `<tr><td class="warn">${k}</td><td>${n}</td></tr>`).join('') : '<tr><td class="dim">none</td></tr>';
+  spark(s.history);
+};
+ws.onclose = () => { $('state').innerHTML = '<span class="bad">DASHBOARD LOST — reconnecting</span>'; setTimeout(() => location.reload(), 1500); };
+</script>
+</body>
+</html>
