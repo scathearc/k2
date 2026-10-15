@@ -1,11 +1,12 @@
 //! Tokio worker pool dispatcher: pulls intents, runs the right engine,
-//! feeds telemetry.
+//! feeds telemetry (including mitigation tool outcome feedback).
 
 use std::sync::Arc;
 
 use tokio::sync::{mpsc, watch};
 
 use crate::config::{Config, HttpVersion};
+use crate::controller::mutation::MutationState;
 use crate::engine::client::WreqPool;
 use crate::engine::h3::H3Engine;
 use crate::engine::ws::WsEngine;
@@ -20,12 +21,14 @@ pub struct Engine {
     http_version: HttpVersion,
     ws_mode: Option<crate::config::WsMode>,
     concurrency: usize,
+    mutation: Option<Arc<MutationState>>,
 }
 
 impl Engine {
     pub async fn build(
         cfg: &Config,
         shutdown_rx: watch::Receiver<bool>,
+        mutation: Option<Arc<MutationState>>,
     ) -> crate::error::K2Result<Self> {
         let http = WreqPool::build(cfg)?;
         let h3 = match cfg.http_version {
@@ -45,6 +48,7 @@ impl Engine {
             http_version: cfg.http_version,
             ws_mode: cfg.ws.clone(),
             concurrency: cfg.concurrency,
+            mutation,
         })
     }
 
@@ -71,6 +75,14 @@ impl Engine {
                     crate::engine::client::execute_http(self.http.pick(), &intent.spec, intended)
                         .await
                 };
+                // Mitigation feedback: steer tool selection away from variants
+                // that keep getting blocked.
+                if let Some(m) = self.mutation.as_ref()
+                    && !intent.spec.mitigation_used.is_empty()
+                {
+                    let blocked = out.status == Some(403);
+                    m.report_result(&intent.spec.mitigation_used, blocked);
+                }
                 telemetry.record_flight_end(&out);
             }
             Work::WsOpen => {

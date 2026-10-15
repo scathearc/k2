@@ -41,7 +41,8 @@ pub async fn run(
     let entropy = Arc::new(std::sync::atomic::AtomicBool::new(cfg.entropy));
 
     let front = Front::new(&cfg)?;
-    let engine = Arc::new(Engine::build(&cfg, stop_rx.clone()).await?);
+    let engine =
+        Arc::new(Engine::build(&cfg, stop_rx.clone(), Some(front.mutation.clone())).await?);
     let engine_ws = engine.clone();
 
     let (intents_tx, intents_rx) =

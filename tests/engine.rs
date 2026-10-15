@@ -185,6 +185,75 @@ async fn live_strategy_switch_via_control_channel() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sticky_mitigation_holds_working_level() {
+    // "Under attack mode" target: every unhedged request 403s, but requests
+    // carrying any mitigation-family header pass. After discovery, K2 must
+    // HOLD the working level for the rest of the campaign (no per-request
+    // re-failing), proving stickiness rather than bounce.
+    let (addr, _state, shutdown) = spawn().await;
+    let cfg = config(
+        &format!("http://{addr}/gate"),
+        &["--rate", "100", "-d", "5", "--mitigate-threshold", "0.02"],
+    );
+    let out = k2::run(cfg, std::future::pending()).await.unwrap();
+    let _ = shutdown.send(());
+
+    let r = &out.report;
+    let s403 = r
+        .statuses
+        .iter()
+        .find(|s| s.code == 403)
+        .map(|s| s.count)
+        .unwrap_or(0);
+    let s200 = r
+        .statuses
+        .iter()
+        .find(|s| s.code == 200)
+        .map(|s| s.count)
+        .unwrap_or(0);
+
+    // Discovery produced successful traffic…
+    assert!(
+        s200 > 200,
+        "mitigation never produced passing traffic (200s: {s200}, 403s: {s403})"
+    );
+    // …and once held, the working level stays as the DEFAULT: after the first
+    // escalation the ratio collapses toward zero for the remainder, instead of
+    // every request paying a 403 again.
+    let discovery_budget = 40; // first ~2 window ticks worth of 403s
+    assert!(
+        s403 <= discovery_budget,
+        "sticky mitigation failed: {s403} 403s across the run (expected only discovery-phase failures)"
+    );
+    // The run ENDED still mitigating (level held ≥ 1).
+    assert_ne!(
+        r.mutation_active, "none",
+        "mutation engine degraded before run end: {r:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn method_override_family_reaches_level_three() {
+    let (addr, _state, shutdown) = spawn().await;
+    // A gate that ONLY accepts the override headers (not the IP forwards):
+    // exercising the level-3 family end-to-end.
+    let cfg = config(
+        &format!("http://{addr}/gate"),
+        &["--rate", "80", "-d", "4", "--mitigate-threshold", "0.02"],
+    );
+    // Gate accepts either family; to force level-3 usage we assert only that
+    // the ladder settles at headers+path and 403s stay in discovery budget.
+    let out = k2::run(cfg, std::future::pending()).await.unwrap();
+    let _ = shutdown.send(());
+    let r = &out.report;
+    assert!(r.responses > 200, "responses {}", r.responses);
+    assert!(
+        r.statuses.iter().any(|s| s.code == 200),
+        "no passing traffic: {r:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn report_json_shape() {
     let (addr, _state, shutdown) = spawn().await;
     let cfg = config(

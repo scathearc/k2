@@ -35,6 +35,16 @@ for architecture decisions — read before changing engines/TLS/scheduler).
   quinn `UdpPoller` implemented via tokio `poll_send_ready`.
 - **axum 0.8** route captures use `{param}` NOT `:param`.
 - **wreq ws module path**: `wreq::ws::message::Message` (not `wreq::ws::Message`).
+- **Mutation engine stickiness** (`controller/mutation.rs`): 3-level ladder
+  (L1 IP headers → L2 path mutation → L3 method-overrides capped by
+  `MitigateCfg.method_override`). `tick_mitigation()` implements the
+  hysteresis: 403-ratio spike → escalate + reset clean streak; proven levels
+  HOLD (demotion only after `DEMOTE_AFTER_TICKS`=30 clean ticks). Tool
+  ranking = per-variant 403-rate EMA (`ALPHA`=0.3) fed by
+  `report_result(tags, is_403)` from `engine/pool.rs` (tags ride on
+  `RequestSpec.mitigation_used`); 1-in-10 deterministic exploration keeps
+  discovery alive. Do NOT make demotion instant — that re-bills a 403 per
+  request on under-attack targets (user decision).
 - **Engine consolidation (user decision)**: ONE stack — wreq/BoringSSL for
   H1/H2/WS; quinn for H3. There is no separate "fast path" rustls engine.
 

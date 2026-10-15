@@ -11,10 +11,28 @@ use std::time::Duration;
 
 use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::{Json, Router};
+
+/// Any mitigation-family header marks the request as "passed the gate".
+fn is_mitigated(h: &HeaderMap) -> bool {
+    const NAMES: &[&str] = &[
+        "X-Forwarded-For",
+        "X-Real-IP",
+        "Client-IP",
+        "X-Client-IP",
+        "True-Client-IP",
+        "CF-Connecting-IP",
+        "X-Forwarded-Client-IP",
+        "Fastly-Client-IP",
+        "X-HTTP-Method-Override",
+        "X-HTTP-Method",
+        "X-Method-Override",
+    ];
+    NAMES.iter().any(|n| h.contains_key(*n))
+}
 
 #[derive(Debug, Default)]
 pub struct HarnessState {
@@ -34,6 +52,7 @@ pub async fn spawn() -> (
         .route("/", get(index))
         .route("/late", get(late))
         .route("/storm", get(storm))
+        .route("/gate", get(gate))
         .route("/big", get(big))
         .route("/ws", get(ws_upgrade))
         // Mutated paths (/%2e-storm, //storm, …) must still exercise the
@@ -74,6 +93,17 @@ async fn storm(State(st): State<Arc<HarnessState>>) -> impl IntoResponse {
         (StatusCode::FORBIDDEN, "blocked")
     } else {
         (StatusCode::OK, "ok")
+    }
+}
+
+/// "Under attack mode" endpoint: hard 403 for ANY request that does not carry
+/// a mitigation-family header. Simulates a WAF gate that legitimate-looking
+/// fixes succeed through — the sticky-mitigation test's target.
+async fn gate(hdrs: HeaderMap) -> impl IntoResponse {
+    if is_mitigated(&hdrs) {
+        (StatusCode::OK, "passed")
+    } else {
+        (StatusCode::FORBIDDEN, "blocked")
     }
 }
 

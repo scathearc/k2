@@ -46,7 +46,7 @@ K2 fixes both structurally:
 | Control | `Fixed`, `Knee` (AIMD α/β/δ), `Pulse` (square wave), `Brownout` (% of knee peak), `Manual` (live rate) with PID saturation guard and rate-limited transitions |
 | Telemetry | Lock-free HDR histograms (logarithmic bucketing, ~0.4% top-end resolution), exact status counters, transport-error taxonomy, `dLat/dt` sliding-window verdict |
 | Proxies | `http://`/`socks5://` CONNECT for TCP paths; custom SOCKS5 **UDP ASSOCIATE** driver so HTTP/3 rides residential relays (10-byte header wrap/peel on a custom `quinn::AsyncUdpSocket`) |
-| Mutation | 403-ratio-triggered header rotation (X-Forwarded-For et al. with CGNAT-source randomization) + path normalizations (`/%2e/`, `//`, `;` truncation) |
+| Mutation | 403-ratio-triggered ladder: L1 IP-forward header rotation (CGNAT-source randomization) → L2 path normalizations (`/%2e/`, `//`, `;` truncation) → L3 method-override headers (`X-HTTP-Method-Override`/`X-HTTP-Method`/`X-Method-Override` × DELETE/PATCH/PUT, nomore403 family). **Discovery is sticky**: per-tool 403-rate EMA steers selection to working variants, a proven level stays engaged by default (no per-request re-failing against under-attack-mode targets), demotion only after ~3s of zero 403s; opt out via `--no-method-override` |
 | UI | ratatui TUI (sparklines, gauges, matrix, hotkeys) + axum web dashboard (WebSocket telemetry @100ms, REST control) — same bus |
 | Output | Text report + `--json` / `--json-file` machine-readable summary |
 

@@ -17,6 +17,8 @@ pub struct RequestSpec {
     pub headers: Vec<(String, String)>,
     pub body: Option<Vec<u8>>,
     pub fidelity: Fidelity,
+    /// Mitigation tags actually attached to THIS request (for tool feedback).
+    pub mitigation_used: Vec<crate::controller::mutation::MitigationTag>,
 }
 
 /// Builds per-request `RequestSpec`s from the campaign config.
@@ -55,9 +57,17 @@ impl Materializer {
         let url = format!("{}{}", self.origin, path_q);
 
         let mut headers = self.base_headers.clone();
+        let mut mitigation_used: Vec<crate::controller::mutation::MitigationTag> = Vec::new();
         if self.mutation.level() >= 1 {
-            let (k, v) = self.mutation.mitigation_header();
-            headers.push((k, v));
+            let tag = self.mutation.mitigation_header();
+            headers.push(tag.clone());
+            mitigation_used.push(tag);
+        }
+        if self.mutation.level() >= 3 {
+            // Method-override family (name × method combos) rides on top.
+            let tag = self.mutation.method_override_header();
+            headers.push(tag.clone());
+            mitigation_used.push(tag);
         }
 
         let body = self.base_body.as_ref().map(|b| {
@@ -79,6 +89,7 @@ impl Materializer {
             headers,
             body,
             fidelity: self.fidelity,
+            mitigation_used,
         }
     }
 }
@@ -129,6 +140,7 @@ mod tests {
                 enabled: false,
                 always: false,
                 threshold: 1.0,
+                method_override: false,
             })),
         )
         .unwrap();
@@ -154,6 +166,7 @@ mod tests {
                 enabled: false,
                 always: false,
                 threshold: 1.0,
+                method_override: false,
             })),
         )
         .unwrap();
@@ -183,6 +196,7 @@ mod tests {
             enabled: true,
             always: true,
             threshold: 1.0,
+            method_override: true,
         }));
         let m = Materializer::from_config(&c, st).unwrap();
         let s = m.materialize(1);

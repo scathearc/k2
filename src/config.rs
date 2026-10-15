@@ -132,6 +132,11 @@ pub struct CliArgs {
     #[arg(long)]
     pub no_mitigate: bool,
 
+    /// Exclude the method-override family (X-HTTP-Method-Override et al.)
+    /// from the mutation escalation ladder
+    #[arg(long)]
+    pub no_method_override: bool,
+
     /// Always apply mutation engine regardless of 403 rate
     #[arg(long)]
     pub mitigate_always: bool,
@@ -316,6 +321,7 @@ pub struct MitigateCfg {
     pub enabled: bool,
     pub always: bool,
     pub threshold: f64,
+    pub method_override: bool,
 }
 
 impl CliArgs {
@@ -417,6 +423,7 @@ impl CliArgs {
                 enabled: !self.no_mitigate,
                 always: self.mitigate_always,
                 threshold: self.mitigate_threshold.clamp(0.0, 1.0),
+                method_override: !self.no_method_override,
             },
             ws: self.ws.clone().map(|s| s.parse()).transpose()?,
             tui,
