@@ -2,6 +2,7 @@
 //! feeds telemetry (including mitigation tool outcome feedback).
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::sync::{mpsc, watch};
 
@@ -107,34 +108,73 @@ impl Engine {
     }
 }
 
-/// Spawn `cfg.concurrency` workers consuming the shared intents stream.
-/// Workers claim exclusivity over the receiver via the shared mutex (claim →
-/// release → execute), and exit once the channel closes and the queue drains.
+/// Spawn the worker pool plus a scaling supervisor.
+///
+/// Workers claim exclusivity over the shared receiver (claim → release →
+/// execute) and exit once the channel closes and the queue drains. The
+/// supervisor grows the pool with the commanded rate using Little's law
+/// (`workers ≈ rate × p99`), because a fixed pool starves under a climbing
+/// closed-loop rate and worker starvation then masquerades as target
+/// saturation in the controller. The pool never shrinks mid-run (tasks are
+/// cheap; churn costs more than the memory).
 pub fn spawn_workers(
     engine: Arc<Engine>,
     telemetry: Arc<Telemetry>,
     intents_rx: mpsc::Receiver<Intent>,
+    max_workers: usize,
+    stop: watch::Receiver<bool>,
 ) -> Vec<tokio::task::JoinHandle<()>> {
-    let n = engine.concurrency().max(1);
+    let floor = engine.concurrency().max(1);
     let rx = Arc::new(tokio::sync::Mutex::new(intents_rx));
-    let mut handles = Vec::with_capacity(n);
-    for _ in 0..n {
-        let rx = rx.clone();
-        let engine = engine.clone();
-        let telemetry = telemetry.clone();
-        handles.push(tokio::spawn(async move {
-            loop {
-                // Claim one intent atomically, then execute outside the lock.
-                let claimed = {
-                    let mut guard = rx.lock().await;
-                    guard.recv().await
-                };
-                match claimed {
-                    None => break, // channel closed & drained
-                    Some(intent) => engine.handle(intent, &telemetry).await,
-                }
+    let handles: Vec<tokio::task::JoinHandle<()>> = (0..floor)
+        .map(|_| spawn_one(&engine, &telemetry, &rx))
+        .collect();
+
+    // Supervisor: grow-only pool management (Little's law).
+    let sup_engine = engine.clone();
+    let sup_telemetry = telemetry.clone();
+    tokio::spawn(async move {
+        let mut live = floor;
+        let mut stop = stop;
+        while !*stop.borrow_and_update() {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            if *stop.borrow() {
+                break;
             }
-        }));
-    }
+            let snap = sup_telemetry.snapshot();
+            let l_s = (snap.p99_ns as f64 / 1e9).clamp(0.005, 5.0);
+            let want =
+                ((snap.target_rate * l_s).ceil() as usize + 8).clamp(floor, max_workers.max(floor));
+            while live < want {
+                let h = spawn_one(&sup_engine, &sup_telemetry, &rx);
+                drop(h); // detached; workers exit via channel close
+                live += 1;
+            }
+        }
+    });
+
     handles
+}
+
+fn spawn_one(
+    engine: &Arc<Engine>,
+    telemetry: &Arc<Telemetry>,
+    rx: &Arc<tokio::sync::Mutex<mpsc::Receiver<Intent>>>,
+) -> tokio::task::JoinHandle<()> {
+    let engine = engine.clone();
+    let telemetry = telemetry.clone();
+    let rx = rx.clone();
+    tokio::spawn(async move {
+        loop {
+            // Claim one intent atomically, then execute outside the lock.
+            let claimed = {
+                let mut guard = rx.lock().await;
+                guard.recv().await
+            };
+            match claimed {
+                None => break, // channel closed & drained
+                Some(intent) => engine.handle(intent, &telemetry).await,
+            }
+        }
+    })
 }

@@ -37,6 +37,19 @@ K2 fixes both structurally:
   and a nomore403-informed header/path mutation engine that escalates when 403
   ratios spike.
 
+## Defaults for blind runs
+
+`k2 https://myapp` with no flags means: **find the knee, safely.**
+
+| Knob | Blind default | Why |
+|---|---|---|
+| Strategy | Knee-of-Curve AIMD from 8 RPS | the answer isn't known yet — that's the point |
+| Duration | 60s (`-d 0` + no `-n` caps at 100k requests) | a knee needs time to emerge |
+| Workers | starts at `-c` (cores), grows with `rate × p99` (Little's law) up to `--max-workers 4096` | a fixed pool starves as AIMD climbs, and starvation masquerades as saturation |
+| Rate ceiling | 5,000 RPS (`--aimd-max-rate` to raise) | a blind run must never accidentally DoS its own target |
+| Warmup | first 1.5s ignores `dLat/dt` breaches (errors still bite) | cold TLS/TTFB noise must not pin the rate at the floor |
+| Output | text report; `--json` for machines; TUI when attached to a TTY | — |
+
 ## Feature map
 
 | Area | What ships |

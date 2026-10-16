@@ -73,7 +73,7 @@ impl Controller {
             entropy,
             max_step_pct: 0.25,
             min_rate: cfg.aimd.min_rate,
-            max_rate: cfg.aimd.max_rate.max(1.0),
+            max_rate: cfg.aimd.max_rate.max(cfg.rate.unwrap_or(0.0)),
             mitigate_cfg: cfg.mitigate,
             quit_flag: false,
         }

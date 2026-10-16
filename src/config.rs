@@ -19,13 +19,19 @@ pub struct CliArgs {
     #[arg(short = 'n', long, default_value_t = 0)]
     pub requests: u64,
 
-    /// Run duration in seconds (0 = until request count is satisfied)
-    #[arg(short = 'd', long, default_value_t = 10.0)]
+    /// Run duration in seconds (0 = until request count or auto budget)
+    #[arg(short = 'd', long, default_value_t = 60.0)]
     pub duration: f64,
 
-    /// Worker concurrency (number of in-flight workers)
+    /// Worker concurrency floor (number of in-flight workers). In
+    /// closed-loop (Knee) mode the pool grows automatically with the
+    /// commanded rate — this is the starting floor.
     #[arg(short = 'c', long, default_value_t = default_concurrency())]
     pub concurrency: usize,
+
+    /// Hard ceiling on the auto-scaled worker pool
+    #[arg(long, default_value_t = 4096)]
+    pub max_workers: usize,
 
     /// Fixed target requests/second. If omitted, defaults to closed-loop Knee (AIMD) hunting
     #[arg(long)]
@@ -104,8 +110,9 @@ pub struct CliArgs {
     #[arg(long, default_value_t = 1.0)]
     pub aimd_min_rate: f64,
 
-    /// Maximum AIMD rate ceiling (requests/sec)
-    #[arg(long, default_value_t = 100_000.0)]
+    /// Maximum AIMD rate ceiling (requests/sec). Blind knee-hunt runs default
+    /// to a conservative 5k ceiling; raise explicitly for capacity tests.
+    #[arg(long, default_value_t = 5_000.0)]
     pub aimd_max_rate: f64,
 
     /// Pulse period seconds (square wave)
@@ -268,6 +275,7 @@ pub struct Config {
     pub requests: Option<u64>,
     pub duration: Option<Duration>,
     pub concurrency: usize,
+    pub max_workers: usize,
     pub strategy: StrategyKind,
     pub rate: Option<f64>,
     pub poisson: bool,
@@ -336,6 +344,11 @@ impl CliArgs {
         } else {
             Some(self.requests)
         };
+        // Auto budget guard: `-d 0` without `-n` must never run unbounded.
+        let requests = match (requests, duration) {
+            (None, None) => Some(100_000u64),
+            (r, _) => r,
+        };
         let http_version = self.http_version;
         let engine = match http_version {
             HttpVersion::H3 => EngineKind::H3,
@@ -392,6 +405,7 @@ impl CliArgs {
             requests,
             duration,
             concurrency: self.concurrency.max(1),
+            max_workers: self.max_workers.max(16),
             strategy,
             rate,
             poisson: self.poisson,

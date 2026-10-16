@@ -1,7 +1,5 @@
 //! AIMD saturation tracking: additive increase / multiplicative decrease.
 
-use std::time::Duration;
-
 use crate::config::AimdCfg;
 use crate::telemetry::derivative::Deriv;
 
@@ -35,7 +33,13 @@ pub struct Aimd {
     /// Max rate observed while the target was still stable — the knee estimate.
     pub peak: f64,
     deriv: Deriv,
+    /// Cold-connection grace: derivative decreases are ignored during the
+    /// first WARMUP_MS so cold TLS/TTFB noise can't pin the rate at the floor.
+    warmup_ms: u64,
 }
+
+/// Duration (ms) of derivative-decrease grace after campaign start.
+pub const WARMUP_MS: u64 = 1500;
 
 impl Aimd {
     pub fn new(p: AimdParams, initial: f64) -> Self {
@@ -44,6 +48,7 @@ impl Aimd {
             peak: initial.max(p.min_rate),
             p,
             deriv: Deriv::new(6),
+            warmup_ms: WARMUP_MS,
         }
     }
 
@@ -58,14 +63,14 @@ impl Aimd {
         }
         self.deriv.push(tick_ms, window_p99_ns);
         let rel = self.deriv.relative();
-        let degrading = rel >= self.p.delta || err_rate > 0.0;
+        let warmup = tick_ms < self.warmup_ms;
+        let degrading = (rel >= self.p.delta && !warmup) || err_rate > 0.0;
         if degrading {
             self.rate = (self.rate * self.p.beta).max(self.p.min_rate);
         } else {
             self.rate = (self.rate + self.p.alpha).min(self.p.max_rate);
             self.peak = self.peak.max(self.rate);
         }
-        let _ = Duration::ZERO;
         self.rate
     }
 
@@ -95,7 +100,7 @@ mod tests {
     fn increases_when_stable() {
         let mut a = Aimd::new(set(), 100.0);
         for i in 0..3u64 {
-            a.tick(i * 100, 1.0e6, 0.0);
+            a.tick(2_000 + i * 100, 1.0e6, 0.0);
         }
         assert!((a.rate - 400.0).abs() < 1e-6, "rate {}", a.rate);
         assert_eq!(a.peak, a.rate);
@@ -104,27 +109,38 @@ mod tests {
     #[test]
     fn decreases_on_derivative_breach() {
         let mut a = Aimd::new(set(), 1000.0);
-        a.tick(0, 1.0e6, 0.0); // stable -> 1100
-        a.tick(100, 2.0e6, 0.0); // +1ms over 100ms => 10ms/s rel 5.0 >= delta -> 825
+        a.tick(2_000, 1.0e6, 0.0); // stable -> 1100
+        a.tick(2_100, 2.0e6, 0.0); // +1ms over 100ms => 10ms/s rel 5.0 >= delta -> 825
         assert!((a.rate - 825.0).abs() < 1e-6, "rate {}", a.rate);
     }
 
     #[test]
     fn decreases_on_errors() {
         let mut a = Aimd::new(set(), 1000.0);
-        a.tick(0, 1.0e6, 0.0); // stable -> 1100
-        a.tick(100, 1.02e6, 0.02);
+        a.tick(2_000, 1.0e6, 0.0); // stable -> 1100
+        a.tick(2_100, 1.02e6, 0.02);
         assert!((a.rate - 825.0).abs() < 1e-6, "rate {}", a.rate);
+    }
+
+    #[test]
+    fn warmup_ignores_derivative_breaches() {
+        let mut a = Aimd::new(set(), 100.0);
+        a.tick(0, 1.0e6, 0.0); // stable -> 200
+        a.tick(100, 5.0e6, 0.0); // cold-start spike: derivative ignored -> 300
+        assert!((a.rate - 300.0).abs() < 1e-6, "rate {}", a.rate);
+        // errors still bite during warmup
+        a.tick(200, 1.0e6, 0.5);
+        assert!((a.rate - 225.0).abs() < 1e-6, "rate {}", a.rate);
     }
 
     #[test]
     fn floors_and_ceilings_hold() {
         let mut a = Aimd::new(set(), 10.0);
-        a.tick(0, 1.0e6, 0.0); // stable -> 110
-        a.tick(100, 1.0e6, 0.9); // errors -> 82.5
+        a.tick(2_000, 1.0e6, 0.0); // stable -> 110
+        a.tick(2_100, 1.0e6, 0.9); // errors -> 82.5
         assert!((a.rate - 82.5).abs() < 1e-6, "rate {}", a.rate);
         a.rate = 99_999.0;
-        a.tick(200, 1.0e6, 0.0);
+        a.tick(2_200, 1.0e6, 0.0);
         assert_eq!(a.rate, 100_000.0);
     }
 

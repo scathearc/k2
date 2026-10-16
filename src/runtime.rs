@@ -55,7 +55,13 @@ pub async fn run(
         telemetry: telemetry.clone(),
         stop_rx: stop_rx.clone(),
     };
-    let workers = spawn_workers(engine.clone(), telemetry.clone(), intents_rx);
+    let workers = spawn_workers(
+        engine.clone(),
+        telemetry.clone(),
+        intents_rx,
+        cfg.max_workers,
+        stop_rx.clone(),
+    );
 
     // Optional web dashboard (spawn; never blocks the run).
     let web_task = cfg.web.map(|addr| {
