@@ -81,7 +81,7 @@ impl Engine {
                 if let Some(m) = self.mutation.as_ref()
                     && !intent.spec.mitigation_used.is_empty()
                 {
-                    let blocked = out.status == Some(403);
+                    let blocked = crate::controller::mutation::is_blocked(out.status);
                     m.report_result(&intent.spec.mitigation_used, blocked);
                 }
                 telemetry.record_flight_end(&out);

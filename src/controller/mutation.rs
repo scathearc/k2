@@ -1,27 +1,39 @@
 //! Dynamic HTTP header/path/method mutation engine (nomore403-informed).
 //!
-//! Three tool families escalate as an adaptive ladder when the observed 403
-//! ratio in the controller window exceeds the threshold:
-//!   level 1 — rotate mitigation headers (X-Forwarded-For et al. with random
-//!             CGNAT-source client IPs)
+//! Tool families escalate as an adaptive ladder when the observed blocked
+//! ratio (403 — and 405, same thing at the edge) in the controller window
+//! exceeds the threshold:
+//!   level 1 — rotate mitigation headers: IP-forward headers with random
+//!             CGNAT-source client IPs, plus the **duplicate X-Forwarded-For**
+//!             raw-dupe tool (the same header twice per request — parsers that
+//!             merge/last-wins/first-wins inconsistently pass it)
 //!   level 2 — additionally mutate path structure (/%2e/, //, ; truncation)
 //!   level 3 — additionally attach method-override headers
 //!             (X-HTTP-Method-Override / X-HTTP-Method / X-Method-Override ×
 //!             DELETE / PATCH / PUT)
 //!
-//! **Discovery is sticky.** Escalation reacts to 403 spikes, but a level that
-//! produced clean traffic is held (with per-tool 403-rate EMA so the working
-//! variants are preferred and failing variants are skipped) — a proven
-//! mitigation becomes the campaign default instead of re-paying a 403 per
-//! request per cycle. Demotion only happens after ~3s of strictly-zero 403
-//! activity, one level at a time.
+//! **Discovery is sticky.** Escalation reacts to blocked spikes, but a level
+//! that produced clean traffic is held (with per-tool blocked-rate EMA so the
+//! working variants are preferred and failing variants are skipped) — a
+//! proven mitigation becomes the campaign default instead of re-paying a 403
+//! per request per cycle. Demotion only happens after ~3s of strictly-zero
+//! blocked activity, one level at a time.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::config::MitigateCfg;
 
-/// IP-forwarding header family (client-source spoofing).
+/// Statuses that mean "blocked at the edge" (405 ~= 403 by user decree: a
+/// method-mismatch block is the same signal as a forbidden block).
+pub const BLOCKED_STATUSES: &[u16] = &[403, 405];
+
+#[inline]
+pub fn is_blocked(code: Option<u16>) -> bool {
+    matches!(code, Some(c) if BLOCKED_STATUSES.contains(&c))
+}
+
+/// IP-forwarding header family (single, client-source spoofing).
 pub const IP_TOOLS: &[&str] = &[
     "X-Forwarded-For",
     "X-Real-IP",
@@ -32,6 +44,9 @@ pub const IP_TOOLS: &[&str] = &[
     "X-Forwarded-Client-IP",
     "Fastly-Client-IP",
 ];
+
+/// Duplicate-XFF raw-dupe tool (the header appears twice per request).
+pub const IP_DUP_TOOLS: &[&str] = &["X-Forwarded-For"];
 
 /// Method-override family: (header, method-value) combinations. Mirrors the
 /// nomore403 probe set — WAF rules that block a literal method/path often
@@ -49,8 +64,25 @@ pub const METHOD_OVERRIDE_COMBOS: &[(&str, &str)] = &[
 ];
 
 const N_IP: usize = IP_TOOLS.len();
+const N_IP_DUP: usize = IP_DUP_TOOLS.len();
 const N_MO: usize = METHOD_OVERRIDE_COMBOS.len();
-pub const TOTAL_TOOLS: usize = N_IP + N_MO;
+pub const TOTAL_TOOLS: usize = N_IP + N_IP_DUP + N_MO;
+
+/// A mitigation applied to one request — the feedback tag.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MitTag {
+    pub name: String,
+    pub value: String,
+    /// Raw-dupe: the (name, value) header is emitted twice.
+    pub dup: bool,
+}
+
+impl MitTag {
+    /// The (name, value) header pair to attach (once per call).
+    pub fn header(&self) -> (String, String) {
+        (self.name.clone(), self.value.clone())
+    }
+}
 
 /// Per-tool recent-403-rate EMA; low = this variant tends to succeed.
 #[derive(Debug, Default)]
@@ -65,10 +97,6 @@ impl ToolStat {
         }
     }
 }
-
-/// One applied mitigation tag, carried on the executed request so its outcome
-/// can feed back into tool selection.
-pub type MitigationTag = (String, String);
 
 /// Shared, lock-free state of the mutation engine.
 #[derive(Debug)]
@@ -168,12 +196,11 @@ impl MutationState {
     }
 
     /// Deterministic tool pick: 1-in-10 uniform exploration, otherwise the
-    /// variant with the lowest recent 403 rate within the family.
+    /// variant with the lowest recent blocked rate within the family.
     fn pick_tool(&self, family: ToolFamily) -> usize {
         let cursor = self.header_cursor.fetch_add(1, Ordering::Relaxed);
         let (start, len) = match family {
-            ToolFamily::IpHeader => (0usize, N_IP),
-            ToolFamily::MethodOverride => (N_IP, N_MO),
+            ToolFamily::MethodOverride => (N_IP + N_IP_DUP, N_MO),
         };
         if cursor.is_multiple_of(10) {
             return start + (mix(cursor) % len as u64) as usize;
@@ -184,33 +211,81 @@ impl MutationState {
             .expect("non-empty family")
     }
 
-    /// Current IP-forwarding tool header (name, random client IP).
-    pub fn mitigation_header(&self) -> MitigationTag {
-        let idx = self.pick_tool(ToolFamily::IpHeader);
-        (IP_TOOLS[idx].to_string(), random_client_ip())
+    /// Current mitigation header from the IP families (single or raw-dupe).
+    pub fn mitigation_header(&self) -> MitTag {
+        // IpDup is a first-class competitor inside the IP family picks.
+        let roll = self.pick_tool_for_ip();
+        match roll {
+            IpPick::Single(idx) => {
+                let name = IP_TOOLS[idx];
+                MitTag {
+                    name: name.to_string(),
+                    value: random_client_ip(),
+                    dup: false,
+                }
+            }
+            IpPick::Dup(idx) => {
+                let name = IP_DUP_TOOLS[idx];
+                MitTag {
+                    name: name.to_string(),
+                    value: random_client_ip(),
+                    dup: true,
+                }
+            }
+        }
+    }
+
+    fn pick_tool_for_ip(&self) -> IpPick {
+        // Combine singles + dup in one ranking space.
+        let cursor = self.header_cursor.fetch_add(1, Ordering::Relaxed);
+        let total = N_IP + N_IP_DUP;
+        let idx = if cursor.is_multiple_of(10) {
+            (mix(cursor) % total as u64) as usize
+        } else {
+            let tools = self.tools.lock().unwrap();
+            (0..total)
+                .min_by(|a, b| tools.ema[*a].total_cmp(&tools.ema[*b]))
+                .expect("non-empty family")
+        };
+        if idx < N_IP {
+            IpPick::Single(idx)
+        } else {
+            IpPick::Dup(idx - N_IP)
+        }
     }
 
     /// Current method-override tool header (name, method value).
-    pub fn method_override_header(&self) -> MitigationTag {
-        let idx = self.pick_tool(ToolFamily::MethodOverride) - N_IP;
+    pub fn method_override_header(&self) -> MitTag {
+        let idx = self.pick_tool(ToolFamily::MethodOverride) - (N_IP + N_IP_DUP);
         let (name, value) = METHOD_OVERRIDE_COMBOS[idx];
-        (name.to_string(), value.to_string())
+        MitTag {
+            name: name.to_string(),
+            value: value.to_string(),
+            dup: false,
+        }
     }
 
     /// Feed the result of one mitigated request back into tool ranking.
-    /// `is_403` marks a blocked response; anything else counts as success.
-    pub fn report_result(&self, tags: &[MitigationTag], is_403: bool) {
+    /// `blocked` marks a 403/405 response; anything else counts as success.
+    pub fn report_result(&self, tags: &[MitTag], blocked: bool) {
         if tags.is_empty() {
             return;
         }
         let mut tools = self.tools.lock().unwrap();
-        let bump = if is_403 { ALPHA } else { 0.0 };
-        for (name, _) in tags {
-            if let Some(i) = IP_TOOLS.iter().position(|n| *n == name) {
+        let bump = if blocked { ALPHA } else { 0.0 };
+        for tag in tags {
+            let idx = if let Some(i) = IP_TOOLS.iter().position(|n| *n == tag.name) {
+                Some(i)
+            } else if IP_DUP_TOOLS.contains(&tag.name.as_str()) && tag.dup {
+                Some(N_IP + IP_DUP_TOOLS.iter().position(|n| *n == tag.name).take_or(0))
+            } else {
+                METHOD_OVERRIDE_COMBOS
+                    .iter()
+                    .position(|(n, _)| *n == tag.name)
+                    .map(|k| N_IP + N_IP_DUP + k)
+            };
+            if let Some(i) = idx {
                 tools.ema[i] = tools.ema[i] * (1.0 - ALPHA) + bump;
-            } else if let Some(k) = METHOD_OVERRIDE_COMBOS.iter().position(|(n, _)| *n == name) {
-                let idx = N_IP + k;
-                tools.ema[idx] = tools.ema[idx] * (1.0 - ALPHA) + bump;
             }
         }
     }
@@ -257,8 +332,25 @@ impl MutationState {
 
 #[derive(Debug, Clone, Copy)]
 enum ToolFamily {
-    IpHeader,
     MethodOverride,
+}
+
+enum IpPick {
+    Single(usize),
+    Dup(usize),
+}
+
+trait TakeOr {
+    fn take_or(self, fallback: usize) -> usize;
+}
+
+impl TakeOr for Option<usize> {
+    fn take_or(self, fallback: usize) -> usize {
+        match self {
+            Some(v) => v,
+            None => fallback,
+        }
+    }
 }
 
 const ALPHA: f64 = 0.3;
@@ -335,16 +427,16 @@ mod tests {
         m.escalate();
         m.escalate();
         assert_eq!(m.level(), 3);
-        let (name, value) = m.method_override_header();
+        let tag = m.method_override_header();
         assert!(
-            name == "X-HTTP-Method-Override"
-                || name == "X-HTTP-Method"
-                || name == "X-Method-Override",
-            "got {name}"
+            tag.name == "X-HTTP-Method-Override"
+                || tag.name == "X-HTTP-Method"
+                || tag.name == "X-Method-Override",
+            "got {tag:?}"
         );
         assert!(
-            matches!(value.as_str(), "DELETE" | "PATCH" | "PUT"),
-            "got {value}"
+            matches!(tag.value.as_str(), "DELETE" | "PATCH" | "PUT"),
+            "got {tag:?}"
         );
     }
 
@@ -403,18 +495,28 @@ mod tests {
     fn failing_tools_rank_down() {
         let m = MutationState::new(cfg(false));
         // Feed: header at index 0 fails 10x; another succeeds repeatedly.
+        let fail_tag = MitTag {
+            name: IP_TOOLS[0].to_string(),
+            value: "1.2.3.4".into(),
+            dup: false,
+        };
+        let pass_tag = MitTag {
+            name: IP_TOOLS[3].to_string(),
+            value: "1.2.3.4".into(),
+            dup: false,
+        };
         for _ in 0..10 {
-            m.report_result(&[(IP_TOOLS[0].to_string(), "1.2.3.4".into())], true);
+            m.report_result(std::slice::from_ref(&fail_tag), true);
         }
         for _ in 0..3 {
-            m.report_result(&[(IP_TOOLS[3].to_string(), "1.2.3.4".into())], false);
+            m.report_result(std::slice::from_ref(&pass_tag), false);
         }
         // Many picks: the failing tool must only surface via the 1-in-10
         // exploration channel, never as the ranked default.
         let mut hit_failing = 0;
         for _i in 0..100u64 {
-            let (name, _) = m.mitigation_header();
-            if name == IP_TOOLS[0] {
+            let tag = m.mitigation_header();
+            if tag.name == IP_TOOLS[0] {
                 hit_failing += 1;
             }
         }
@@ -429,7 +531,7 @@ mod tests {
         let m = MutationState::new(cfg(true));
         let mut seen = std::collections::HashSet::new();
         for _ in 0..N_IP * 4 {
-            seen.insert(m.mitigation_header().0);
+            seen.insert(m.mitigation_header().name);
         }
         // exploration keeps most names live over time
         assert!(seen.len() >= 3, "saw {seen:?}");

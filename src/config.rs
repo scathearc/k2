@@ -13,7 +13,36 @@ use clap::{Parser, ValueEnum};
 )]
 pub struct CliArgs {
     /// Target URL. Supports random charclass templates: https://t.local/api/[a-z][1-9]?q=[a-f]
-    pub target: String,
+    #[arg(required_unless_present_any = ["swarm_provision", "node_server"])]
+    pub target: Option<String>,
+
+    /// One-time: scaffold + build the k2-node e2b template (needs e2b CLI)
+    #[arg(long, value_name = "TEMPLATE")]
+    pub swarm_provision: Option<String>,
+
+    /// Node-server mode: wait for coordinator configure/snapshot/rate calls
+    #[arg(long, value_name = "PORT")]
+    pub node_server: Option<u16>,
+
+    /// Distribute the campaign across N e2b sandboxes (swarm coordinator mode)
+    #[arg(long, value_name = "N")]
+    pub swarm: Option<u64>,
+
+    /// Swarm provider: e2b | fake (local loopback child nodes)
+    #[arg(long, value_enum, default_value_t = SwarmProvider::E2b)]
+    pub provider: SwarmProvider,
+
+    /// Provisioned e2b template name (or K2_TEMPLATE env)
+    #[arg(long, default_value = "k2-node")]
+    pub swarm_template: String,
+
+    /// Fleet node count of the node-server port inside sandboxes
+    #[arg(long, default_value_t = 9601)]
+    pub swarm_port: u16,
+
+    /// Sandbox TTL seconds (e2b)
+    #[arg(long, default_value_t = 3600)]
+    pub sandbox_ttl: u64,
 
     /// Total number of requests to issue (0 = unlimited)
     #[arg(short = 'n', long, default_value_t = 0)]
@@ -198,7 +227,8 @@ pub struct CliArgs {
     pub log_level: String,
 }
 
-#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum HttpVersion {
     Auto,
     H1,
@@ -206,7 +236,8 @@ pub enum HttpVersion {
     H3,
 }
 
-#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Fidelity {
     Chrome,
     Firefox,
@@ -218,7 +249,8 @@ pub enum Fidelity {
     None,
 }
 
-#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum StrategyKind {
     Fixed,
     Knee,
@@ -227,7 +259,10 @@ pub enum StrategyKind {
     Manual,
 }
 
-#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(
+    ValueEnum, Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "lowercase")]
 pub enum DegradeSignal {
     /// Non-2xx status + transport-error ratio (reliable "is it broken")
     #[default]
@@ -238,7 +273,16 @@ pub enum DegradeSignal {
     Both,
 }
 
-#[derive(Debug, Clone)]
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SwarmProvider {
+    /// e2b Firecracker sandboxes (needs E2B_API_KEY + provisioned template)
+    #[default]
+    E2b,
+    /// Local loopback child processes (tests / no-cloud runs)
+    Fake,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct WsMode {
     pub hold: u64,
     pub churn_per_s: f64,
@@ -290,10 +334,11 @@ fn default_concurrency() -> usize {
 }
 
 /// Fully resolved run-time configuration (post-validation).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Config {
     pub target: String,
     pub method: String,
+    #[serde(default)]
     pub bind: Option<std::net::IpAddr>,
     pub requests: Option<u64>,
     pub duration: Option<Duration>,
@@ -301,14 +346,17 @@ pub struct Config {
     pub max_workers: usize,
     pub strategy: StrategyKind,
     pub rate: Option<f64>,
+    #[serde(default)]
     pub poisson: bool,
     pub headers: Vec<(String, String)>,
     pub body: Option<Vec<u8>>,
+    #[serde(default)]
     pub entropy: bool,
     pub http_version: HttpVersion,
     pub engine: EngineKind,
     pub tls_verify: bool,
     pub fidelity: Fidelity,
+    #[serde(default)]
     pub proxy: Option<String>,
     pub timeout: Option<Duration>,
     pub connect_timeout: Duration,
@@ -316,15 +364,25 @@ pub struct Config {
     pub pulse: PulseCfg,
     pub brownout_pct: f64,
     pub mitigate: MitigateCfg,
+    #[serde(default)]
     pub ws: Option<WsMode>,
+    #[serde(default)]
     pub tui: bool,
+    #[serde(default)]
     pub web: Option<SocketAddr>,
+    #[serde(default)]
     pub json: bool,
+    #[serde(default)]
     pub json_file: Option<String>,
+    #[serde(default = "default_log_level")]
     pub log_level: String,
 }
 
-#[derive(Debug, Clone, Copy)]
+fn default_log_level() -> String {
+    "warn".into()
+}
+
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct AimdCfg {
     pub alpha: f64,
     pub beta: f64,
@@ -335,7 +393,7 @@ pub struct AimdCfg {
     pub status_threshold: f64,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct PulseCfg {
     pub period: f64,
     pub duty: f64,
@@ -343,13 +401,14 @@ pub struct PulseCfg {
     pub lo: f64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum EngineKind {
     Wreq,
     H3,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct MitigateCfg {
     pub enabled: bool,
     pub always: bool,
@@ -424,7 +483,10 @@ impl CliArgs {
         }
 
         Ok(Config {
-            target: self.target.clone(),
+            target: self
+                .target
+                .clone()
+                .ok_or_else(|| "missing <TARGET>".to_string())?,
             method: self.method.clone(),
             bind: self.bind,
             requests,

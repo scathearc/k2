@@ -16,6 +16,9 @@ pub struct WindowTotals {
     pub s503: u64,
     /// Status codes >= 400 in the window (status-first degradation signal).
     pub bad_status: u64,
+    /// Explicit 405s — method-blocked at the edge; equivalent to 403 for
+    /// mitigation purposes.
+    pub s405: u64,
 }
 
 #[derive(Debug)]
@@ -126,6 +129,7 @@ impl ClassifierState {
             }
             match code {
                 403 => wt.s403 += n,
+                405 => wt.s405 += n,
                 429 => wt.s429 += n,
                 503 => wt.s503 += n,
                 _ => {}

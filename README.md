@@ -132,6 +132,26 @@ injection, 403 storms, and a WebSocket echo to exercise the real engine:
 rate adherence ±15%, CO anchoring under injected latency, mutation
 escalation, graceful drain, WS churn, JSON report shape.
 
+## Distributed mode (e2b swarm)
+
+```sh
+# One-time: build the node template (e2b CLI + a linux-musl k2 binary)
+rustup target add x86_64-unknown-linux-musl
+cargo build --release --target x86_64-unknown-linux-musl
+k2 --swarm-provision k2-node
+
+# Fan a campaign out across N sandboxes; the coordinator runs the closed
+# loop over merged fleet telemetry and commands rate/N to each node
+E2B_API_KEY=... k2 https://target.app/api --swarm 8 --rate 2000 -d 30 --json
+```
+
+The point is **sustained pressure**, not aggregate RPS: per-source-IP edge
+limits adapt to a single hammering source within seconds (and stay adapted);
+N concurrent sources each below the per-IP ceiling keep the campaign working
+past the adaptation, and the status-first controller proves the target is
+still visible (`403/405/5xx` = blocked; latency noise never throttles the
+loop). Nodes can also route through `--proxy` residential exits.
+
 ## Known limitations
 
 - `IP_BIND_ADDRESS_NO_PORT`/AnyIP raw source binding is plumbed for the H3

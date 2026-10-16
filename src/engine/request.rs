@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use crate::config::{Config, Fidelity};
-use crate::controller::mutation::MutationState;
+use crate::controller::mutation::{MitTag, MutationState};
 use crate::engine::urltemplate::{UrlTemplate, split_origin};
 use crate::error::{K2Error, K2Result};
 use crate::tls::fingerprints;
@@ -18,7 +18,7 @@ pub struct RequestSpec {
     pub body: Option<Vec<u8>>,
     pub fidelity: Fidelity,
     /// Mitigation tags actually attached to THIS request (for tool feedback).
-    pub mitigation_used: Vec<crate::controller::mutation::MitigationTag>,
+    pub mitigation_used: Vec<crate::controller::mutation::MitTag>,
 }
 
 /// Builds per-request `RequestSpec`s from the campaign config.
@@ -57,16 +57,20 @@ impl Materializer {
         let url = format!("{}{}", self.origin, path_q);
 
         let mut headers = self.base_headers.clone();
-        let mut mitigation_used: Vec<crate::controller::mutation::MitigationTag> = Vec::new();
+        let mut mitigation_used: Vec<MitTag> = Vec::new();
         if self.mutation.level() >= 1 {
             let tag = self.mutation.mitigation_header();
-            headers.push(tag.clone());
+            headers.push(tag.header());
+            if tag.dup {
+                // raw-dupe: the same header twice in one request
+                headers.push(tag.header());
+            }
             mitigation_used.push(tag);
         }
         if self.mutation.level() >= 3 {
             // Method-override family (name × method combos) rides on top.
             let tag = self.mutation.method_override_header();
-            headers.push(tag.clone());
+            headers.push(tag.header());
             mitigation_used.push(tag);
         }
 

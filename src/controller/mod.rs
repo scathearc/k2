@@ -149,9 +149,10 @@ impl Controller {
             0.0
         };
 
-        // 403-reactive mutation engine
+        // Blocked-reactive mutation engine: 403 and 405 are the same signal
+        // (edge blocks, whether forbidden or method-not-allowed).
         let ratio403 = if attempts > 0 {
-            window.s403 as f64 / attempts as f64
+            (window.s403 + window.s405) as f64 / attempts as f64
         } else {
             0.0
         };

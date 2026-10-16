@@ -28,7 +28,7 @@ impl Scheduler {
             cfg,
             materializer,
             intents_tx,
-            rate_rx,
+            mut rate_rx,
             telemetry,
             mut stop_rx,
         } = self;
@@ -40,6 +40,10 @@ impl Scheduler {
 
         let mut seq: u64 = 0;
         let mut next_arrival: Instant = start;
+        // A rate update invalidates the current grid: the old spacing produced
+        // slots that can sit arbitrarily far in the future (rate-0 parking
+        // runs at dt=100s), and the forward slip guard only fixes past slots.
+        let mut grid_dirty = false;
 
         loop {
             if *stop_rx.borrow() {
@@ -56,14 +60,22 @@ impl Scheduler {
                 break;
             }
 
+            // A rate-0 command (node-mode startup) parks at the floor until
+            // the coordinator's first rate push arrives; every rate UPDATE
+            // must wake the sleep below so the new grid applies immediately —
+            // otherwise a 0.01/s grid would sleep for 100s per intent.
             let rate = {
-                let r = *rate_rx.borrow();
-                if r <= 0.01 { 0.01 } else { r }
+                let r = *rate_rx.borrow_and_update();
+                if r < 0.01 { 0.01 } else { r }
             };
             let dt = 1.0 / rate;
 
             // Slip guard: never build an unbounded backlog of late slots.
             let now = Instant::now();
+            if grid_dirty {
+                next_arrival = now;
+                grid_dirty = false;
+            }
             if now > next_arrival + Duration::from_secs_f64(dt) + Duration::from_millis(50) {
                 next_arrival = now;
             }
@@ -123,6 +135,14 @@ impl Scheduler {
 
             tokio::select! {
                 _ = tokio::time::sleep_until(tokio::time::Instant::from_std(next_arrival)) => {}
+                r = rate_rx.changed() => {
+                    // New grid: mark dirty so the next pass re-anchors the
+                    // arrival accumulator at *now*.
+                    if r.is_err() {
+                        break;
+                    }
+                    grid_dirty = true;
+                }
                 _ = wait_stop(&mut stop_rx) => {}
             }
         }

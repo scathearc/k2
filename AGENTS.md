@@ -48,6 +48,29 @@ for architecture decisions — read before changing engines/TLS/scheduler).
 - **Engine consolidation (user decision)**: ONE stack — wreq/BoringSSL for
   H1/H2/WS; quinn for H3. There is no separate "fast path" rustls engine.
 
+- **Blocked family**: 403 and 405 are THE SAME signal (user decree); mutation
+  trigger + tool EMA use `is_blocked()` / `BLOCKED_STATUSES`. Tool families:
+  IP headers (8), **IP_DUP** (`X-Forwarded-For` twice per request — raw-dupe),
+  method overrides (9 combos). `MitTag{dup}` rides on
+  `RequestSpec.mitigation_used`.
+- **Status-first control (user decree)**: latency is a QUEUE signal, not a
+  health signal (5x latency w/ 200s = fine). Default `--degrade-signal status`
+  (non-2xx+error ratio ≥ `--degrade-status-threshold` 0.02 → degrading);
+  latency derivative only via `latency`/`both`. Never re-add latency as the
+  default primary signal.
+- **Scheduler grid invalidation**: rate updates mark `grid_dirty` →
+  `next_arrival = now`. A parked scheduler (rate-0 → dt=100s) with stale
+  future slots otherwise sleeps through its rate commands (found via swarm).
+  Any scheduler change must keep this.
+- **Swarm** (`src/swarm/`): coordinator pulls snapshots + pushes rate over
+  node public URLs (`https://9601-{sandboxId}.e2b.app`); nodes are
+  `k2 --node-server 9601` inside an e2b template (one-time
+  `k2 --swarm-provision k2-node` with a linux-musl binary in
+  ./k2-swarm-provision/). FakeProvider = in-process node servers (NEVER spawn
+  child processes in tests — current_exe is the test runner). Merge =
+  per-node cumulative-bucket slot + delta windows. Node campaign =
+  scheduler+engine only (NO controller — coordinator owns the loop).
+
 ## Testing
 
 `tests/common/mod.rs` spins a local axum harness (latency injection, 403

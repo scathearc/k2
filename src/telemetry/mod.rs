@@ -463,6 +463,32 @@ impl Telemetry {
         (statuses, errors, bytes_in, bytes_out, ws)
     }
 
+    /// Node-mode ingest payload for the swarm coordinator: cumulative buckets
+    /// (merge = sum across nodes), maps, and counters.
+    pub fn ingest_payload(&self, node: u64) -> crate::swarm::ingest::IngestPayload {
+        let (lat_cum, lag_cum) = {
+            let cum = self.cum.lock().unwrap();
+            (cum.lat.counts.clone(), cum.lag.counts.clone())
+        };
+        let statuses = self.cls.status_map();
+        let errors = self.cls.error_map();
+        crate::swarm::ingest::IngestPayload {
+            node,
+            done: false,
+            count_total: self.total_count.load(Ordering::Relaxed),
+            dispatched: self.dispatched(),
+            in_flight: self.in_flight(),
+            bytes_in: self.bytes_in.load(Ordering::Relaxed),
+            bytes_out: self.bytes_out.load(Ordering::Relaxed),
+            ws_held: self.ws_held(),
+            status_map: statuses,
+            error_map: errors,
+            lat_cum,
+            lag_cum,
+            ws: None,
+        }
+    }
+
     pub fn snapshot(&self) -> Snapshot {
         self.rx.borrow().clone()
     }

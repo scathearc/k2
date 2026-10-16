@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use crate::config::{Config, Fidelity, WsMode};
@@ -16,7 +16,7 @@ use crate::telemetry::Outcome;
 use crate::tls::fingerprints;
 
 /// Live WS population stats for the web/TUI surfaces and the final report.
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct WsStats {
     pub opened: u64,
     pub closed: u64,

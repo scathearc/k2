@@ -3,6 +3,7 @@ pub mod controller;
 pub mod engine;
 pub mod error;
 pub mod report;
+pub mod swarm;
 pub mod telemetry;
 pub mod tls;
 pub mod ui;

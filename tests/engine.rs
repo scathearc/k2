@@ -308,6 +308,51 @@ async fn status_signal_backs_off_on_failures() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn swarm_fake_provider_merges_nodes() {
+    // 2 local node processes against the harness; the coordinator splits the
+    // request budget and merges cumulative buckets. The merged count must
+    // reflect BOTH nodes' work.
+    let (addr, state, shutdown) = spawn().await;
+    let cfg = config(
+        &format!("http://{addr}/"),
+        &[
+            "--swarm",
+            "2",
+            "--provider",
+            "fake",
+            "--rate",
+            "100",
+            "-d",
+            "4",
+        ],
+    );
+    let out = k2::swarm::coordinator::run_swarm(
+        cfg,
+        2,
+        k2::swarm::provider::ProviderCfg::Fake,
+        600,
+        std::future::pending(),
+    )
+    .await
+    .unwrap();
+    let _ = shutdown.send(());
+
+    let r = &out.report;
+    assert_eq!(out.nodes, 2, "swarm result nodes {}", out.nodes);
+    // Per-node rate = 50 (commanded/split); the PID starvation guard typically
+    // caps the commanded rate (merged-window visibility lag), so expect
+    // ≥ 300 merged responses over ~4s, i.e. clear two-node aggregate work.
+    assert!(
+        r.responses >= 300,
+        "merged responses {} — nodes are not contributing aggregate work",
+        r.responses
+    );
+    assert!(r.statuses.iter().any(|s| s.code == 200), "{r:?}");
+    assert!(r.errors.is_empty(), "{r:?}");
+    assert!(state.hits.load(Ordering::Relaxed) >= 300);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn report_json_shape() {
     let (addr, _state, shutdown) = spawn().await;
     let cfg = config(
