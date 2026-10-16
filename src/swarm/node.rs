@@ -64,8 +64,27 @@ pub struct ConfigureBody {
     pub config: Config,
 }
 
-/// Serve the node control surface; blocks until the process should exit.
+/// Serve the node control surface on an already-bound listener; blocks until
+/// the process should exit. The caller owns port selection (use `:0` for an
+/// OS-assigned port — the FakeProvider does this to avoid collisions across
+/// test runs).
+pub async fn serve_with_listener(listener: tokio::net::TcpListener) -> crate::error::K2Result<()> {
+    let port = match listener.local_addr() {
+        Ok(a) => a.port(),
+        Err(_) => 0,
+    };
+    serve_inner(port, listener).await
+}
+
+/// Bind on `port` and serve; blocks until the process should exit.
 pub async fn serve(port: u16) -> crate::error::K2Result<()> {
+    let listener = tokio::net::TcpListener::bind(("0.0.0.0", port))
+        .await
+        .map_err(crate::error::K2Error::Io)?;
+    serve_inner(port, listener).await
+}
+
+async fn serve_inner(port: u16, listener: tokio::net::TcpListener) -> crate::error::K2Result<()> {
     let state = NodeState::new();
     let run_state = state.clone();
 
@@ -163,9 +182,6 @@ pub async fn serve(port: u16) -> crate::error::K2Result<()> {
         .route("/drain", post(drain))
         .with_state(state);
 
-    let listener = tokio::net::TcpListener::bind(("0.0.0.0", port))
-        .await
-        .map_err(crate::error::K2Error::Io)?;
     tracing::info!("node server listening on :{port}");
     axum::serve(listener, app)
         .await

@@ -200,14 +200,19 @@ struct FakeProvider;
 impl Provider for FakeProvider {
     fn spawn_fleet<'a>(&'a self, n: u64, _ttl_s: u64) -> BoxFut<'a, K2Result<Vec<NodeEndpoint>>> {
         Box::pin(async move {
-            // In-process node servers on loopback ports (hermetic for tests;
-            // child-process spawning would launch the test-runner binary).
+            // In-process node servers on loopback ports. Bind `:0` first so
+            // the OS hands us a free port — the old fixed-port scheme collided
+            // with nodes left over from previous test runs and made the
+            // health-wait loop time out on "Address already in use".
             let mut nodes = Vec::new();
             for i in 0..n {
-                let port = NODE_PORT + i as u16 + 39;
+                let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+                    .await
+                    .map_err(K2Error::Io)?;
+                let port = listener.local_addr().map_err(K2Error::Io)?.port();
                 tokio::spawn(async move {
-                    if let Err(e) = crate::swarm::node::serve(port).await {
-                        eprintln!("fake node on {port}: {e}");
+                    if let Err(e) = crate::swarm::node::serve_with_listener(listener).await {
+                        eprintln!("fake node on :{port}: {e}");
                     }
                 });
                 nodes.push(NodeEndpoint {
