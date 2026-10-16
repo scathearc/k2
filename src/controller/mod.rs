@@ -130,11 +130,14 @@ impl Controller {
     }
 
     /// One 100ms controller tick. Returns the commanded target rate.
+    /// `status_ratio` is the window non-2xx + transport-error ratio (the
+    /// status-first degradation signal).
     pub fn on_tick(
         &mut self,
         tick_ms: u64,
         window: &WindowTotals,
         window_p99_ns: f64,
+        status_ratio: f64,
         actual_rps: f64,
     ) -> f64 {
         self.apply_msgs();
@@ -161,7 +164,9 @@ impl Controller {
                 self.clamp_rate(self.base_fixed_rate + corr)
             }
             StrategyKind::Knee => {
-                let r = self.knee.tick(tick_ms, window_p99_ns, err_rate);
+                let r = self
+                    .knee
+                    .tick(tick_ms, window_p99_ns, err_rate, status_ratio);
                 self.clamp_rate(r)
             }
             StrategyKind::Pulse => {

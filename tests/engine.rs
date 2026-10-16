@@ -254,6 +254,60 @@ async fn method_override_family_reaches_level_three() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn status_signal_keeps_pressure_under_latency_noise() {
+    // The user-facing truth from real campaigns: 5x latency with 200s means
+    // the app is fine. Under the status-first signal, a knee-hunt must climb
+    // to its ceiling against a slow-but-healthy target — latency noise never
+    // throttles the loop (the old latency-multiple controllers did exactly
+    // that and "saw 200s" while never holding pressure).
+    let (addr, state, shutdown) = spawn().await;
+    state.latency_ms.store(300, Ordering::Relaxed);
+    let cfg = config(&format!("http://{addr}/late"), &["-d", "4", "-c", "64"]);
+    let out = k2::run(cfg, std::future::pending()).await.unwrap();
+    let _ = shutdown.send(());
+
+    let r = &out.report;
+    assert!(r.statuses.iter().any(|s| s.code == 200), "{r:?}");
+    assert!(r.errors.is_empty(), "{r:?}");
+    // Latency carried in the CO-corrected accounting…
+    assert!(r.latency.p99_ms >= 250.0, "p99 {}", r.latency.p99_ms);
+    // …but irrelevant to the loop: the knee climbed hard (alpha=100/tick from
+    // an 8 RPS start + smoothing reaches ~3.5k in 4s against the ceiling).
+    assert!(
+        r.target_rps > 3000.0,
+        "knee never climbed under status-first signal: target {}",
+        r.target_rps
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn status_signal_backs_off_on_failures() {
+    let (addr, state, shutdown) = spawn().await;
+    state.fail_403_until.store(u64::MAX, Ordering::Relaxed);
+    // Knee (no --rate) against an all-403 target: the status-first loop must
+    // find the floor, not climb forever.
+    let cfg = config(&format!("http://{addr}/storm"), &["-d", "4"]);
+    let out = k2::run(cfg, std::future::pending()).await.unwrap();
+    let _ = shutdown.send(());
+
+    let r = &out.report;
+    let s403 = r
+        .statuses
+        .iter()
+        .find(|s| s.code == 403)
+        .map(|s| s.count)
+        .unwrap_or(0);
+    assert!(s403 > 0, "no 403s recorded");
+    // Backed off to the min-rate floor (1 RPS): the ramp decays fast (β=0.75
+    // per 100ms tick from any height reaches the floor within ~2s).
+    assert!(
+        r.target_rps <= 100.0,
+        "status-first loop never backed off: target {}",
+        r.target_rps
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn report_json_shape() {
     let (addr, _state, shutdown) = spawn().await;
     let cfg = config(

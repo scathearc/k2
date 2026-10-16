@@ -14,6 +14,8 @@ pub struct WindowTotals {
     pub s429: u64,
     pub s403: u64,
     pub s503: u64,
+    /// Status codes >= 400 in the window (status-first degradation signal).
+    pub bad_status: u64,
 }
 
 #[derive(Debug)]
@@ -24,6 +26,7 @@ pub struct ClassifierState {
     err_window: [AtomicU64Cell; N_KINDS],
     window_count: AtomicU64Cell,
     window_err_count: AtomicU64Cell,
+    window_bad_status: AtomicU64Cell,
 }
 
 pub const N_KINDS: usize = 10;
@@ -66,6 +69,7 @@ impl ClassifierState {
             err_window: std::array::from_fn(|_| AtomicU64Cell::default()),
             window_count: Default::default(),
             window_err_count: Default::default(),
+            window_bad_status: Default::default(),
         }
     }
 
@@ -75,6 +79,9 @@ impl ClassifierState {
         self.status_total[i].inc();
         self.status_window[i].inc();
         self.window_count.inc();
+        if usize::from(code) >= 400 {
+            self.window_bad_status.inc();
+        }
     }
 
     #[inline]
@@ -109,6 +116,7 @@ impl ClassifierState {
         let mut wt = WindowTotals {
             count: self.window_count.take(),
             errors: self.window_err_count.take(),
+            bad_status: self.window_bad_status.take(),
             ..Default::default()
         };
         for (code, cell) in self.status_window.iter().enumerate() {

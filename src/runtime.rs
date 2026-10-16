@@ -111,7 +111,23 @@ pub async fn run(
                 let window_p99 = telemetry.window_p99_of(&td);
                 let elapsed_ms = telemetry.started().elapsed().as_millis() as u64;
                 let window_rps = (td.window.count as f64) * (1000.0 / TICK_MS as f64);
-                let rate = controller.on_tick(elapsed_ms, &td.window, window_p99, window_rps);
+                // Status-first degradation signal: non-2xx statuses plus
+                // transport errors over the attempted window.
+                let attempts = td.window.count + td.window.errors;
+                let status_ratio = if attempts > 0 {
+                    (td.window.bad_status + td.window.errors) as f64 / attempts as f64
+                } else if td.window.errors > 0 {
+                    1.0
+                } else {
+                    0.0
+                };
+                let rate = controller.on_tick(
+                    elapsed_ms,
+                    &td.window,
+                    window_p99,
+                    status_ratio,
+                    window_rps,
+                );
                 telemetry.set_target_rate(rate);
                 telemetry.set_strategy_label(controller.label());
                 telemetry.finish_tick(td);

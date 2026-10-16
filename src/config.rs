@@ -102,9 +102,21 @@ pub struct CliArgs {
     #[arg(long, default_value_t = 0.75)]
     pub aimd_beta: f64,
 
-    /// AIMD latency-derivative threshold (relative dLat/dt per second)
+    /// AIMD latency-derivative threshold (relative dLat/dt per second).
+    /// Only consulted when --degrade-signal includes latency.
     #[arg(long, default_value_t = 0.35)]
     pub aimd_delta: f64,
+
+    /// Degradation signal the closed loop judges: status (non-2xx+error
+    /// ratio — primary, reliable), latency (dLat/dt derivative — a queue-depth
+    /// signal, NOT a health signal), or both.
+    #[arg(long, value_enum, default_value_t = DegradeSignal::Status)]
+    pub degrade_signal: DegradeSignal,
+
+    /// Non-2xx + transport-error ratio (0-1) above which the loop judges the
+    /// target degraded. Latency alone never triggers this.
+    #[arg(long, default_value_t = 0.02)]
+    pub degrade_status_threshold: f64,
 
     /// Minimum AIMD rate floor (requests/sec)
     #[arg(long, default_value_t = 1.0)]
@@ -215,6 +227,17 @@ pub enum StrategyKind {
     Manual,
 }
 
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DegradeSignal {
+    /// Non-2xx status + transport-error ratio (reliable "is it broken")
+    #[default]
+    Status,
+    /// Latency derivative dLat/dt (queue-depth indicator; can mislead)
+    Latency,
+    /// Either signal trips the loop
+    Both,
+}
+
 #[derive(Debug, Clone)]
 pub struct WsMode {
     pub hold: u64,
@@ -308,6 +331,8 @@ pub struct AimdCfg {
     pub delta: f64,
     pub min_rate: f64,
     pub max_rate: f64,
+    pub signal: DegradeSignal,
+    pub status_threshold: f64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -425,6 +450,8 @@ impl CliArgs {
                 delta: self.aimd_delta.max(0.001),
                 min_rate: self.aimd_min_rate.max(1.0),
                 max_rate: self.aimd_max_rate.max(10.0),
+                signal: self.degrade_signal,
+                status_threshold: self.degrade_status_threshold.clamp(0.001, 1.0),
             },
             pulse: PulseCfg {
                 period: self.pulse_period.max(0.5),
