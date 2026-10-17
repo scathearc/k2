@@ -71,6 +71,12 @@ pub struct CliArgs {
     #[arg(long, value_name = "IP")]
     pub bind: Option<std::net::IpAddr>,
 
+    /// CIDR subnet to draw a different source IP from for EVERY request
+    /// (AnyIP source rotation). e.g. --bind-net 2001:db8::/64. Overrides
+    /// --bind when both are set.
+    #[arg(long, value_name = "CIDR")]
+    pub bind_net: Option<String>,
+
     /// Poisson (exponentially distributed) arrival jitter instead of uniform pacing
     #[arg(long)]
     pub poisson: bool,
@@ -340,6 +346,8 @@ pub struct Config {
     pub method: String,
     #[serde(default)]
     pub bind: Option<std::net::IpAddr>,
+    #[serde(default)]
+    pub bind_net: Option<BindNet>,
     pub requests: Option<u64>,
     pub duration: Option<Duration>,
     pub concurrency: usize,
@@ -380,6 +388,62 @@ pub struct Config {
 
 fn default_log_level() -> String {
     "warn".into()
+}
+
+/// A CIDR subnet for AnyIP source rotation: every request draws a fresh
+/// source address from the subnet, so the target sees a rotating source
+/// rather than a single pinned IP.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct BindNet {
+    pub net: ipnet::IpNet,
+}
+
+impl std::fmt::Display for BindNet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.net)
+    }
+}
+
+impl BindNet {
+    pub fn parse(s: &str) -> Result<Self, String> {
+        let net: ipnet::IpNet = s
+            .parse()
+            .map_err(|e| format!("invalid --bind-net CIDR {s}: {e}"))?;
+        // Only a subnet with a routable host portion can rotate; a /32 or
+        // /128 is a single address and would be a no-op rotation.
+        if net.prefix_len()
+            >= match net {
+                ipnet::IpNet::V4(_) => 32,
+                ipnet::IpNet::V6(_) => 128,
+            }
+        {
+            return Err(format!(
+                "--bind-net {s} has no routable host addresses (use a /64 or smaller)"
+            ));
+        }
+        Ok(Self { net })
+    }
+
+    /// Deterministic-random source address for `seq`. Seeded from seq so
+    /// retries and re-runs reproduce the same address for a given seq.
+    pub fn pick(&self, seq: u64) -> std::net::IpAddr {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        seq.hash(&mut h);
+        let n = h.finish() as u128;
+        match self.net {
+            ipnet::IpNet::V4(net) => {
+                let base = u32::from_be_bytes(net.network().octets());
+                let host = n % (1u128 << (32 - net.prefix_len()));
+                std::net::IpAddr::V4(std::net::Ipv4Addr::from((base as u128 + host) as u32))
+            }
+            ipnet::IpNet::V6(net) => {
+                let base = u128::from_be_bytes(net.network().octets());
+                let host = n % (1u128 << (128 - net.prefix_len()));
+                std::net::IpAddr::V6(std::net::Ipv6Addr::from(base + host))
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
@@ -489,6 +553,7 @@ impl CliArgs {
                 .ok_or_else(|| "missing <TARGET>".to_string())?,
             method: self.method.clone(),
             bind: self.bind,
+            bind_net: self.bind_net.as_deref().map(BindNet::parse).transpose()?,
             requests,
             duration,
             concurrency: self.concurrency.max(1),
@@ -551,5 +616,47 @@ impl CliArgs {
                     .map_err(|e| format!("bad --web addr: {e}"))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod bind_net_tests {
+    use super::*;
+
+    #[test]
+    fn pick_rotates_within_subnet() {
+        let bn = BindNet::parse("2001:db8::/64").unwrap();
+        let mut addrs = std::collections::HashSet::new();
+        for seq in 0..200u64 {
+            let ip = bn.pick(seq);
+            assert!(bn.net.contains(&ip), "picked {ip} outside {bn}");
+            addrs.insert(ip);
+        }
+        assert!(addrs.len() > 1, "bind-net must rotate source IPs");
+    }
+
+    #[test]
+    fn parse_rejects_full_range() {
+        assert!(BindNet::parse("2001:db8::/128").is_err());
+        assert!(BindNet::parse("10.0.0.1/32").is_err());
+    }
+
+    #[test]
+    fn pick_is_deterministic() {
+        let bn = BindNet::parse("2001:db8::/64").unwrap();
+        assert_eq!(bn.pick(7), bn.pick(7));
+        assert_ne!(bn.pick(7), bn.pick(8));
+    }
+
+    #[test]
+    fn pick_v4_rotates_within_subnet() {
+        let bn = BindNet::parse("10.0.0.0/24").unwrap();
+        let mut addrs = std::collections::HashSet::new();
+        for seq in 0..300u64 {
+            let ip = bn.pick(seq);
+            assert!(bn.net.contains(&ip), "picked {ip} outside {bn}");
+            addrs.insert(ip);
+        }
+        assert!(addrs.len() > 1, "bind-net must rotate source IPs");
     }
 }

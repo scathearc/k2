@@ -71,8 +71,12 @@ pub fn build_client(cfg: &Config) -> K2Result<wreq::Client> {
         b = b.proxy(p);
     }
 
-    // Source-IP surface (AnyIP / local address pinning).
-    if let Some(ip) = cfg.bind {
+    // Source-IP surface (AnyIP / local address pinning). When a --bind-net
+    // CIDR is configured the bind is per-request (see execute_http); only a
+    // bare --bind is a client-level pin.
+    if let Some(ip) = cfg.bind
+        && cfg.bind_net.is_none()
+    {
         b = b.local_address(ip);
     }
 
@@ -99,6 +103,10 @@ pub async fn execute_http(
     // Randomized fingerprint per request: a coherent browser profile picked
     // per dispatch (per fresh TLS connection effectively).
     let mut rb = client.request(method, spec.url.as_str());
+    // AnyIP source rotation: pick a fresh source address per request.
+    if let Some(ip) = spec.bind {
+        rb = rb.local_address(ip);
+    }
     if let Some(em) = fingerprints::pick(spec.fidelity) {
         rb = rb.emulation(em);
     }

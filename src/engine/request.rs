@@ -17,6 +17,9 @@ pub struct RequestSpec {
     pub headers: Vec<(String, String)>,
     pub body: Option<Vec<u8>>,
     pub fidelity: Fidelity,
+    /// Per-request source IP for AnyIP rotation (None = use the client's
+    /// configured local address).
+    pub bind: Option<std::net::IpAddr>,
     /// Mitigation tags actually attached to THIS request (for tool feedback).
     pub mitigation_used: Vec<crate::controller::mutation::MitTag>,
 }
@@ -31,6 +34,7 @@ pub struct Materializer {
     pub fidelity: Fidelity,
     entropy: bool,
     mutation: Arc<MutationState>,
+    bind_net: Option<crate::config::BindNet>,
 }
 
 impl Materializer {
@@ -46,6 +50,7 @@ impl Materializer {
             fidelity: cfg.fidelity,
             entropy: cfg.entropy,
             mutation,
+            bind_net: cfg.bind_net.clone(),
         })
     }
 
@@ -94,6 +99,7 @@ impl Materializer {
             body,
             fidelity: self.fidelity,
             mitigation_used,
+            bind: self.bind_net.as_ref().map(|n| n.pick(seq)),
         }
     }
 }
@@ -132,6 +138,24 @@ mod tests {
         c.target = target.to_string();
         c.body = body.map(|b| b.as_bytes().to_vec());
         c.entropy = entropy;
+        c
+    }
+
+    fn cfg_with_bind_net(target: &str, cidr: &str) -> Config {
+        use clap::Parser as _;
+        let args = crate::config::CliArgs::try_parse_from([
+            "k2",
+            "-d",
+            "5",
+            "--rate",
+            "10",
+            "--bind-net",
+            cidr,
+            target,
+        ])
+        .unwrap();
+        let mut c = args.into_config().unwrap();
+        c.target = target.to_string();
         c
     }
 
@@ -183,6 +207,37 @@ mod tests {
             }
         }
         assert!(!all_same, "entropy must vary payloads");
+    }
+
+    #[test]
+    fn bind_net_rotates_source_ip_per_request() {
+        let c = cfg_with_bind_net("https://t.local/", "2001:db8::/64");
+        let m = Materializer::from_config(
+            &c,
+            Arc::new(MutationState::new(MitigateCfg {
+                enabled: false,
+                always: false,
+                threshold: 1.0,
+                method_override: false,
+            })),
+        )
+        .unwrap();
+        let mut seen = std::collections::HashSet::new();
+        for seq in 0..64u64 {
+            let s = m.materialize(seq);
+            let ip = s.bind.expect("bind-net must set a per-request source IP");
+            assert!(
+                c.bind_net.as_ref().unwrap().net.contains(&ip),
+                "picked {ip} outside subnet"
+            );
+            seen.insert(ip);
+        }
+        assert!(
+            seen.len() > 1,
+            "bind-net must rotate source IPs across requests"
+        );
+        // Deterministic: same seq always yields the same IP.
+        assert_eq!(m.materialize(3).bind, m.materialize(3).bind);
     }
 
     #[test]

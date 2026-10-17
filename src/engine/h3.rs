@@ -41,6 +41,17 @@ struct H3Conn {
 
 impl H3Engine {
     pub async fn build(cfg: &Config) -> K2Result<Arc<Self>> {
+        // H3 keeps one multiplexed connection per endpoint, and the endpoint
+        // binds its UDP socket once. AnyIP rotation is therefore not available
+        // on H3 — refuse loudly rather than silently ignoring the flag.
+        if cfg.bind_net.is_some() {
+            return Err(K2Error::Config(
+                "--bind-net (AnyIP source rotation) is not supported for HTTP/3: \
+                 H3 binds a single UDP socket for the whole run. \
+                 Use --bind <ip> to pin, or run H1/H2 for per-request rotation."
+                    .into(),
+            ));
+        }
         let (server_addr, server_name) = resolve_target(cfg).await?;
         let qtls = h3_tls_config(cfg.tls_verify)?;
         let proxy = cfg
@@ -65,9 +76,9 @@ impl H3Engine {
         if let Some(e) = self.endpoint.get() {
             return Ok(e);
         }
-        let bind_addr = bind_for(&self.server_addr, self.bind);
         let endpoint = match &self.proxy {
             None => {
+                let bind_addr = bind_for(&self.server_addr, self.bind, None);
                 let socket = std::net::UdpSocket::bind(bind_addr)?;
                 quinn::Endpoint::new(
                     quinn::EndpointConfig::default(),
@@ -80,6 +91,7 @@ impl H3Engine {
             Some(spec) => {
                 let association = udp_associate(spec).await?;
                 let relay = association.relay;
+                let bind_addr = bind_for(&self.server_addr, self.bind, Some(relay));
                 let udp = Arc::new(UdpSocket::bind(bind_addr).await?);
                 let sock = Socks5UdpSocket::new(udp, association, relay);
                 quinn::Endpoint::new_with_abstract_socket(
@@ -111,7 +123,7 @@ impl H3Engine {
             .map_err(|e| K2Error::Engine(format!("h3 setup: {e}")))?;
         // Drive the H3 connection state machine until it closes.
         tokio::spawn(async move {
-            let _closed: h3::error::ConnectionError =
+            let _: h3::error::ConnectionError =
                 std::future::poll_fn(|cx| driver.poll_close(cx)).await;
         });
         Ok(H3Conn { qconn, send })
@@ -254,7 +266,17 @@ fn touch_scratch(buf: &mut impl bytes::Buf) {
     }
 }
 
-fn bind_for(server: &SocketAddr, bind: Option<std::net::IpAddr>) -> SocketAddr {
+fn bind_for(
+    server: &SocketAddr,
+    bind: Option<std::net::IpAddr>,
+    relay: Option<SocketAddr>,
+) -> SocketAddr {
+    // When tunnelling through a SOCKS5 relay, the local UDP socket must share
+    // the relay's address family — an IPv6 socket cannot sendmsg() to an IPv4
+    // relay (EINVAL). The server's family is irrelevant in that case.
+    if let Some(r) = relay {
+        return SocketAddr::new(r.ip(), 0);
+    }
     match bind {
         // Explicit source IP: keep the server's family.
         Some(ip) if ip.is_ipv4() == server.is_ipv4() => SocketAddr::new(ip, 0),
