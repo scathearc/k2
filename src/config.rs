@@ -89,11 +89,13 @@ pub struct CliArgs {
     #[arg(short = 'H', long = "header")]
     pub headers: Vec<String>,
 
-    /// Request body (verbatim)
+    /// Request body (verbatim, or with [a-z] charclass templates that expand
+    /// fresh per request: '{"user": "[a-z][a-z][0-9]"}')
     #[arg(long)]
     pub body: Option<String>,
 
-    /// Request body from file
+    /// Request body from file; [a-z] charclass templates in the file expand
+    /// fresh per request (JSON arrays like [1,2,3] stay literal)
     #[arg(long)]
     pub body_file: Option<String>,
 
@@ -199,7 +201,8 @@ pub struct CliArgs {
     #[arg(long, default_value_t = 0.05)]
     pub mitigate_threshold: f64,
 
-    /// Randomize payload bytes per request (payload entropy)
+    /// Randomize payload bytes per request (payload entropy; superseded when
+    /// the body contains charclass templates)
     #[arg(long)]
     pub entropy: bool,
 

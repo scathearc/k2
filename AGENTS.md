@@ -34,6 +34,12 @@ for architecture decisions — read before changing engines/TLS/scheduler).
   conn is held in `Socks5UdpSocket._control` — dropping it kills the relay.
   quinn `UdpPoller` implemented via tokio `poll_send_ready`.
 - **axum 0.8** route captures use `{param}` NOT `:param`.
+- **Body templating**: `--body`/`--body-file` share the URL charclass grammar
+  via `UrlTemplate::parse_body` (JSON-safe: a `[...]` group is a class only if
+  its atoms are pure class chars — `[1,2,3]`/`[]` stay literal; probe-scan on
+  a cloned iterator, commit on success). Expansion lives in
+  `Materializer::materialize` and WINS over `--entropy` (byte-randomizing
+  would destroy JSON). Non-UTF-8 bodies stay verbatim.
 - **wreq ws module path**: `wreq::ws::message::Message` (not `wreq::ws::Message`).
 - **Mutation engine stickiness** (`controller/mutation.rs`): 3-level ladder
   (L1 IP headers → L2 path mutation → L3 method-overrides capped by

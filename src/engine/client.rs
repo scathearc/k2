@@ -107,6 +107,11 @@ pub async fn execute_http(
     if let Some(ip) = spec.bind {
         rb = rb.local_address(ip);
     }
+    if std::env::var("K2_LOG_BIND").is_ok()
+        && let Some(ip) = spec.bind
+    {
+        eprintln!("k2-bind: seq={} src={ip}", spec.seq);
+    }
     if let Some(em) = fingerprints::pick(spec.fidelity) {
         rb = rb.emulation(em);
     }

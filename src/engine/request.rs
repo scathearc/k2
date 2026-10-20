@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use crate::config::{Config, Fidelity};
 use crate::controller::mutation::{MitTag, MutationState};
-use crate::engine::urltemplate::{UrlTemplate, split_origin};
+use crate::engine::urltemplate::{BodyTemplate, UrlTemplate, split_origin};
 use crate::error::{K2Error, K2Result};
 use crate::tls::fingerprints;
 
@@ -31,6 +31,9 @@ pub struct Materializer {
     suffix_template: UrlTemplate,
     base_headers: Vec<(String, String)>,
     base_body: Option<Vec<u8>>,
+    /// Parsed when the body contains `[a-z]`-style charclasses; expanded
+    /// fresh per request. None ⇒ verbatim/entropy body handling.
+    body_template: Option<BodyTemplate>,
     pub fidelity: Fidelity,
     entropy: bool,
     mutation: Arc<MutationState>,
@@ -41,12 +44,19 @@ impl Materializer {
     pub fn from_config(cfg: &Config, mutation: Arc<MutationState>) -> K2Result<Self> {
         let (origin, suffix) = split_origin(&cfg.target);
         let suffix_template = UrlTemplate::parse(&suffix).map_err(K2Error::Config)?;
+        // Body templating: parse once so JSON-safe charclasses are expanded
+        // per request. Non-UTF-8 bodies (binary payloads) stay verbatim.
+        let body_template = cfg.body.as_deref().and_then(|b| {
+            let t = BodyTemplate::parse_body(std::str::from_utf8(b).ok()?);
+            t.has_variables().then_some(t)
+        });
         Ok(Self {
             method: cfg.method.clone(),
             origin,
             suffix_template,
             base_headers: cfg.headers.clone(),
             base_body: cfg.body.clone(),
+            body_template,
             fidelity: cfg.fidelity,
             entropy: cfg.entropy,
             mutation,
@@ -79,17 +89,23 @@ impl Materializer {
             mitigation_used.push(tag);
         }
 
-        let body = self.base_body.as_ref().map(|b| {
-            if self.entropy {
-                let mut b = b.clone();
-                for byte in b.iter_mut() {
-                    *byte = rand::random();
+        let body = if let Some(t) = &self.body_template {
+            // Charclass expansion wins over --entropy: byte-randomizing a
+            // templated body would destroy its structure.
+            Some(t.expand().into_bytes())
+        } else {
+            self.base_body.as_ref().map(|b| {
+                if self.entropy {
+                    let mut b = b.clone();
+                    for byte in b.iter_mut() {
+                        *byte = rand::random();
+                    }
+                    b
+                } else {
+                    b.clone()
                 }
-                b
-            } else {
-                b.clone()
-            }
-        });
+            })
+        };
 
         RequestSpec {
             seq,
@@ -246,6 +262,113 @@ mod tests {
         assert!(validate_target(&c).is_ok());
         c.target = "t.local/path".into();
         assert!(validate_target(&c).is_err());
+    }
+
+    #[test]
+    fn body_file_template_expands_per_request() {
+        use clap::Parser as _;
+        // True end-to-end: write the template to a file, load via --body-file.
+        let path = std::env::temp_dir().join(format!(
+            "k2-body-tpl-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, "{\"username\": \"[a-z][a-z][a-z][0-9][0-9]\"}").unwrap();
+        let args = crate::config::CliArgs::try_parse_from([
+            "k2",
+            "-d",
+            "5",
+            "--rate",
+            "10",
+            "--body-file",
+            path.to_str().unwrap(),
+            "https://t.local/",
+        ])
+        .unwrap();
+        let c = args.into_config().unwrap();
+        let _ = std::fs::remove_file(&path);
+        let m = Materializer::from_config(
+            &c,
+            Arc::new(MutationState::new(MitigateCfg {
+                enabled: false,
+                always: false,
+                threshold: 1.0,
+                method_override: false,
+            })),
+        )
+        .unwrap();
+        let mut seen = std::collections::HashSet::new();
+        for seq in 0..64u64 {
+            let s = m.materialize(seq);
+            let b = s.body.expect("templated body must materialize");
+            let text = std::str::from_utf8(&b).unwrap();
+            let user = text.split(": ").nth(1).unwrap();
+            assert_eq!(user.len(), 8, "{text}"); // "user" }
+            assert_eq!(user.as_bytes()[0], b'"');
+            assert!(user[1..4].bytes().all(|b| b.is_ascii_lowercase()));
+            assert!(user[4..6].bytes().all(|b| b.is_ascii_digit()));
+            assert_eq!(user.as_bytes()[6], b'"');
+            assert_eq!(user.as_bytes()[7], b'}');
+            seen.insert(b);
+        }
+        assert!(seen.len() > 1, "body template must vary per request");
+    }
+
+    #[test]
+    fn body_template_beats_entropy() {
+        use clap::Parser as _;
+        let args = crate::config::CliArgs::try_parse_from([
+            "k2",
+            "-d",
+            "5",
+            "--rate",
+            "10",
+            "--entropy",
+            "https://t.local/",
+        ])
+        .unwrap();
+        let mut c = args.into_config().unwrap();
+        c.body = Some(b"{\"n\": [1,2,3], \"u\": \"[a-z]\"}".to_vec());
+        let m = Materializer::from_config(
+            &c,
+            Arc::new(MutationState::new(MitigateCfg {
+                enabled: false,
+                always: false,
+                threshold: 1.0,
+                method_override: false,
+            })),
+        )
+        .unwrap();
+        for seq in 0..16 {
+            let body = m.materialize(seq).body.unwrap();
+            let text = std::str::from_utf8(&body).unwrap();
+            assert!(
+                text.starts_with("{\"n\": [1,2,3]"),
+                "array must survive: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn plain_body_stays_verbatim() {
+        let c = cfg("https://t.local/", Some("{\"k\": [1,2]}"), false);
+        let m = Materializer::from_config(
+            &c,
+            Arc::new(MutationState::new(MitigateCfg {
+                enabled: false,
+                always: false,
+                threshold: 1.0,
+                method_override: false,
+            })),
+        )
+        .unwrap();
+        for seq in 0..8 {
+            let s = m.materialize(seq);
+            assert_eq!(s.body.as_ref().unwrap().as_slice(), b"{\"k\": [1,2]}");
+        }
     }
 
     #[test]

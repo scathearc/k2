@@ -88,6 +88,10 @@ k2 wss://t.local/ws --ws "1000:50:200:64" -d 120
 # Randomized path templating (fresh value per request)
 k2 "https://t.local/api/[a-z][1-9]?q=[a-f0-9]" --rate 300 -d 20
 
+# Randomized body templating (--body works the same way; JSON arrays stay literal)
+#   signup-bodies.json: {"username": "[a-z][a-z][a-z][0-9][0-9]", "tags": [1,2]}
+k2 https://t.local/signup -X POST --body-file ./signup-bodies.json -H 'Content-Type: application/json' --rate 500 -d 30
+
 # Strategy hotkeys in the TUI: K knee · B brownout · P pulse · E entropy · +/- rate · Q drain
 ```
 

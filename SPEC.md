@@ -266,7 +266,7 @@ It will also support WebSockets, with the ability to initiate and hold large num
 
 While it will support manual configuration flags similar to tools like (https://github.com/hatoo/oha) and many other prominent competitors, it will default to it's dynamically adjusted configuration being a core feature in order to maxmize the effectiveness of assisting operators in determining their infrastructure's true capacity.
 
-Core requirements would be things like supporting randomized regex for target URL's e.g. mytarget.localhost/api/v1/someEndpoint?query=[a-z][1-9], adding custom headers, etc.
+Core requirements would be things like supporting randomized regex for target URL's e.g. mytarget.localhost/api/v1/someEndpoint?query=[a-z][1-9], the same charclass templating for request bodies via --body/--body-file (e.g. {"username": "[a-z][a-z][a-z][0-9][0-9]"} expands fresh per request, while JSON arrays like [1,2,3] stay literal), adding custom headers, etc.
 
 9. Universal Distributed Ephemeral Worker Architecture (Cloud-Agnostic Swarm) (Single-node capability first, adaptability ready for community-developed adapters)
 K2 scales seamlessly across heterogeneous compute environments without relying on proprietary cloud Orchestrators or vendor-specific load generators. A single, statically linked Rust binary functions as both the master controller and the ephemeral worker node.
