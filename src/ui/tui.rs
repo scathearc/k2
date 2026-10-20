@@ -152,6 +152,14 @@ fn render(f: &mut ratatui::Frame, snap: &Snapshot) {
             Style::default().fg(Color::White),
         ),
         Span::styled(
+            format!(" | FLEET: ×{} ", snap.nodes),
+            Style::default().fg(if snap.nodes > 1 {
+                Color::LightGreen
+            } else {
+                Color::DarkGray
+            }),
+        ),
+        Span::styled(
             format!(" | dLat/dt: {:.3} ({}) ", snap.dlat_rel, trend_label),
             Style::default().fg(trend_color),
         ),

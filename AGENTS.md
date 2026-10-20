@@ -76,6 +76,13 @@ for architecture decisions — read before changing engines/TLS/scheduler).
   child processes in tests — current_exe is the test runner). Merge =
   per-node cumulative-bucket slot + delta windows. Node campaign =
   scheduler+engine only (NO controller — coordinator owns the loop).
+- **Swarm UI**: coordinator feeds merged fleet data into a display-bus
+  `Telemetry` via `swarm_tick` each 100ms; the stock TUI/web attach to it
+  unchanged (`--tui`/`--web` on the coordinator). `drain_window` returns
+  AND RESETS counters (it returns lat buckets too; p99 derives from the
+  drained buckets, not post-drain reads). Window rps math uses the true
+  `window_ms` — poll deltas arrive in ~500ms chunks and assuming TICK_MS
+  inflates rps ~5×. Do not re-add post-drain `window_p99_ns` reads.
 
 ## Testing
 

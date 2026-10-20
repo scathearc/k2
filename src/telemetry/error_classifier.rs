@@ -55,6 +55,9 @@ impl AtomicU64Cell {
     fn get(&self) -> u64 {
         self.0.load(std::sync::atomic::Ordering::Relaxed)
     }
+    fn set(&self, v: u64) {
+        self.0.store(v, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 impl Default for ClassifierState {
@@ -93,6 +96,24 @@ impl ClassifierState {
         self.err_total[i].inc();
         self.err_window[i].inc();
         self.window_err_count.inc();
+    }
+
+    /// Replace cumulative totals from an external aggregate (swarm display
+    /// bus: the coordinator mirrors merged fleet maps each tick). Window
+    /// cells are zeroed — swarm windows arrive via MergeStore, not here.
+    pub fn replace_totals(&self, statuses: &[(u16, u64)], errors: &[(ErrorKind, u64)]) {
+        for cell in &self.status_total {
+            cell.set(0);
+        }
+        for cell in &self.err_total {
+            cell.set(0);
+        }
+        for (code, n) in statuses {
+            self.status_total[usize::from(*code) % MAX_STATUS].set(*n);
+        }
+        for (kind, n) in errors {
+            self.err_total[kind.index() % N_KINDS].set(*n);
+        }
     }
 
     /// Read cumulative per-status counts (non-window).

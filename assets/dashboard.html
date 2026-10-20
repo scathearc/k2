@@ -81,7 +81,7 @@ ws.onmessage = ev => {
   const degr = s.trend === 'degrading';
   $('dlat').innerHTML = '<span class="' + (degr ? 'bad' : 'ok') + '">dLat/dt ' + s.dlat_rel.toFixed(3) + ' (' + (degr ? 'DEGRADING' : 'STABLE') + ')</span>';
   $('state').innerHTML = '<span class="dot ' + (s.running ? 'ok' : 'warn') + '"></span>' + (s.running ? 'RUNNING' : 'INIT');
-  $('runtime').textContent = 'runtime ' + s.elapsed_s.toFixed(1) + 's — requests ' + s.count_total;
+  $('runtime').textContent = 'runtime ' + s.elapsed_s.toFixed(1) + 's — requests ' + s.count_total + (s.nodes > 1 ? ' · fleet ×' + s.nodes : '');
   $('strategy').textContent = s.strategy;
   $('statuses').innerHTML = s.statuses.map(([c, n, p]) => `<tr><td>${c}</td><td>${n}</td><td class="dim">${p.toFixed(1)}%</td></tr>`).join('');
   $('errors').innerHTML = s.errors.length ? s.errors.map(([k, n]) => `<tr><td class="warn">${k}</td><td>${n}</td></tr>`).join('') : '<tr><td class="dim">none</td></tr>';

@@ -111,8 +111,35 @@ pub async fn run_swarm(
     let merge = Arc::new(MergeStore::new(lat_cfg));
     let (rate_tx, _rate_rx) = watch::channel(cfg.rate.unwrap_or(8.0));
     let (stop_tx, stop_rx) = watch::channel(false);
-    let (_control_tx, control_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (control_tx, control_rx) = tokio::sync::mpsc::unbounded_channel();
     let entropy = Arc::new(std::sync::atomic::AtomicBool::new(cfg.entropy));
+
+    // Display bus: a Telemetry fed with merged fleet data each tick, so the
+    // stock TUI/web surfaces render the SWARM AGGREGATE unchanged. Neither
+    // surface runs on nodes — the coordinator owns them.
+    let display = Arc::new(crate::telemetry::Telemetry::new());
+    display.set_fleet_nodes(nodes.len() as u32);
+    display.set_strategy_label(format!("swarm×{} booting", nodes.len()));
+    let web_task = cfg.web.map(|addr| {
+        let display = display.clone();
+        let control = control_tx.clone();
+        let stop = stop_rx.clone();
+        tokio::spawn(async move {
+            if let Err(e) = crate::ui::web::serve(addr, display, control, stop).await {
+                tracing::error!("web dashboard exited: {e}");
+            }
+        })
+    });
+    let tui_task = if cfg.tui {
+        let display = display.clone();
+        let control = control_tx.clone();
+        let stop = stop_rx.clone();
+        Some(tokio::spawn(async move {
+            crate::ui::tui::run_tui(display, control, stop).await
+        }))
+    } else {
+        None
+    };
 
     // Controller mutation state: coordinator-side mirror (403 reactions are
     // merged from node data via window s403 counts).
@@ -176,6 +203,7 @@ pub async fn run_swarm(
     // stays in scope for the final strategy label).
     let mut interrupted = false;
     let started = Instant::now();
+    let mut last_drain = started;
     let mut iv = tokio::time::interval(Duration::from_millis(crate::telemetry::TICK_MS));
     iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     iv.tick().await;
@@ -194,8 +222,23 @@ pub async fn run_swarm(
                 if controller.poll_quit() {
                     break;
                 }
-                let window = merge.drain_window();
-                let window_p99 = merge.window_p99_ns();
+                let (window, win_lat) = merge.drain_window();
+                let window_ms = last_drain.elapsed().as_millis() as u64;
+                last_drain = Instant::now();
+                if std::env::var("K2_LOG_SWARM").is_ok() {
+                    eprintln!(
+                        "k2-swarm: t={}ms window count={} err={} ms={window_ms}",
+                        started.elapsed().as_millis(),
+                        window.count,
+                        window.errors
+                    );
+                }
+                let window_agg = crate::telemetry::histogram::Agg {
+                    cfg: lat_cfg,
+                    total: win_lat.iter().sum(),
+                    counts: win_lat.clone(),
+                };
+                let window_p99 = window_agg.quantile(0.99).unwrap_or(0) as f64;
                 let attempts = window.count + window.errors;
                 let status_ratio = if attempts > 0 {
                     (window.bad_status + window.errors) as f64 / attempts as f64
@@ -203,10 +246,41 @@ pub async fn run_swarm(
                     0.0
                 };
                 let elapsed_ms = started.elapsed().as_millis() as u64;
-                let actual_rps = (window.count as f64) * (1000.0 / crate::telemetry::TICK_MS as f64);
+                // RPS over the window's TRUE span — poll deltas arrive in
+                // ~500ms chunks; assuming 100ms windows inflates rps ~5×.
+                let actual_rps = if window_ms > 0 {
+                    window.count as f64 * 1000.0 / window_ms as f64
+                } else {
+                    0.0
+                };
                 let rate = controller.on_tick(elapsed_ms, &window, window_p99, status_ratio, actual_rps);
                 commanded.store(rate as u64, Ordering::Relaxed);
                 let _ = rate_tx.send(rate);
+
+                // Mirror the merged fleet state into the display bus.
+                let md = merge.merged_display();
+                display.set_target_rate(rate);
+                display.set_strategy_label(format!(
+                    "{} · fleet {} node{}",
+                    controller.label(),
+                    nodes.len(),
+                    if nodes.len() == 1 { "" } else { "s" }
+                ));
+                display.swarm_tick(crate::telemetry::SwarmTick {
+                    window,
+                    win_lat_buckets: win_lat,
+                    cum_lat_counts: md.lat_counts,
+                    cum_lag_counts: md.lag_counts,
+                    status_map: md.statuses,
+                    error_map: md.errors,
+                    count_total: md.count_total,
+                    dispatched: md.dispatched,
+                    in_flight: md.in_flight,
+                    bytes_in: md.bytes_in,
+                    bytes_out: md.bytes_out,
+                    ws_held: md.ws_held,
+                    window_ms,
+                });
             }
         }
     }
@@ -229,6 +303,32 @@ pub async fn run_swarm(
         }
     }
     provider.kill_fleet(&nodes).await;
+
+    // Final display frame before the UIs shut down, then join them.
+    {
+        let md = merge.merged_display();
+        let _ = display.swarm_tick(crate::telemetry::SwarmTick {
+            window: Default::default(),
+            win_lat_buckets: Vec::new(),
+            cum_lat_counts: md.lat_counts,
+            cum_lag_counts: md.lag_counts,
+            status_map: md.statuses,
+            error_map: md.errors,
+            count_total: md.count_total,
+            dispatched: md.dispatched,
+            in_flight: md.in_flight,
+            bytes_in: md.bytes_in,
+            bytes_out: md.bytes_out,
+            ws_held: md.ws_held,
+            window_ms: crate::telemetry::TICK_MS,
+        });
+    }
+    if let Some(t) = web_task {
+        let _ = t.await;
+    }
+    if let Some(t) = tui_task {
+        let _ = t.await;
+    }
 
     let (lat, lag, statuses, errors, count_total, dispatched, bytes_in, bytes_out, ws) =
         merge.merged_final();

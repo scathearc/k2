@@ -353,6 +353,81 @@ async fn swarm_fake_provider_merges_nodes() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn swarm_web_dashboard_shows_fleet_aggregate() {
+    // The coordinator's display bus must surface merged fleet telemetry on
+    // the stock web dashboard: /api/stats reports aggregate count_total,
+    // fleet size, and the fleet strategy label while the campaign runs.
+    let (addr, _state, shutdown) = spawn().await;
+    // Grab a free port for the dashboard, then release it for the server.
+    let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let dash_addr = probe.local_addr().unwrap();
+    drop(probe);
+
+    let mut cfg = config(
+        &format!("http://{addr}/"),
+        &[
+            "--swarm",
+            "2",
+            "--provider",
+            "fake",
+            "--rate",
+            "100",
+            "-d",
+            "3",
+        ],
+    );
+    cfg.web = Some(dash_addr);
+
+    let poller = tokio::spawn(async move {
+        let client = wreq::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+        let mut saw_aggregate = false;
+        for _ in 0..120 {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let Ok(r) = client
+                .get(format!("http://{dash_addr}/api/stats"))
+                .send()
+                .await
+            else {
+                continue;
+            };
+            let Ok(text) = r.text().await else { continue };
+            let Ok(j) = serde_json::from_str::<serde_json::Value>(&text) else {
+                continue;
+            };
+            let count = j["count_total"].as_u64().unwrap_or(0);
+            let nodes = j["nodes"].as_u64().unwrap_or(0);
+            let strategy = j["strategy"].as_str().unwrap_or("");
+            let in_flight_ok = j["in_flight"].is_number();
+            if count > 0 && nodes == 2 && strategy.contains("fleet") && in_flight_ok {
+                saw_aggregate = true;
+                break;
+            }
+        }
+        saw_aggregate
+    });
+
+    let out = k2::swarm::coordinator::run_swarm(
+        cfg,
+        2,
+        k2::swarm::provider::ProviderCfg::Fake,
+        600,
+        std::future::pending(),
+    )
+    .await
+    .unwrap();
+    let _ = shutdown.send(());
+
+    assert!(
+        poller.await.unwrap(),
+        "web dashboard never showed the fleet aggregate"
+    );
+    assert!(out.report.responses > 0, "swarm must do aggregate work");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn report_json_shape() {
     let (addr, _state, shutdown) = spawn().await;
     let cfg = config(

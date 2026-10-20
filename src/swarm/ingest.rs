@@ -64,6 +64,7 @@ struct NodeSlot {
     bytes_in: u64,
     bytes_out: u64,
     in_flight: u64,
+    ws_held: u64,
     statuses: HashMap<u16, u64>,
     errors: HashMap<ErrorKind, u64>,
     lat_cum: Vec<u64>,
@@ -90,6 +91,7 @@ fn slot_from(p: &IngestPayload) -> NodeSlot {
         bytes_in: p.bytes_in,
         bytes_out: p.bytes_out,
         in_flight: p.in_flight,
+        ws_held: p.ws_held,
         statuses: p.status_map.iter().copied().collect(),
         errors: p.error_map.iter().cloned().collect(),
         lat_cum: p.lat_cum.clone(),
@@ -97,6 +99,21 @@ fn slot_from(p: &IngestPayload) -> NodeSlot {
         ws: p.ws.clone(),
         done: p.done,
     }
+}
+
+/// Cheap merged cumulative view for the display bus.
+#[derive(Debug, Default, Clone)]
+pub struct MergedDisplay {
+    pub lat_counts: Vec<u64>,
+    pub lag_counts: Vec<u64>,
+    pub statuses: Vec<(u16, u64)>,
+    pub errors: Vec<(ErrorKind, u64)>,
+    pub count_total: u64,
+    pub dispatched: u64,
+    pub in_flight: u64,
+    pub bytes_in: u64,
+    pub bytes_out: u64,
+    pub ws_held: u64,
 }
 
 /// Coordinator-side merge store.
@@ -216,34 +233,63 @@ impl MergeStore {
         }
     }
 
-    /// Drain the accumulated window for the controller tick.
-    pub fn drain_window(&self) -> WindowTotals {
+    /// Drain the accumulated window for the controller tick. Returns the
+    /// tallies plus the window's merged latency buckets (same-tick data —
+    /// the caller derives the window p99 from them, mirroring how a local
+    /// run computes p99 from its own drained window).
+    pub fn drain_window(&self) -> (WindowTotals, Vec<u64>) {
         let mut w = self.window.lock().unwrap();
         let wt = WindowTotals {
-            count: w.count,
-            errors: w.errors,
-            bad_status: w.bad_status,
-            s403: w.s403,
-            s405: w.s405,
+            count: std::mem::take(&mut w.count),
+            errors: std::mem::take(&mut w.errors),
+            bad_status: std::mem::take(&mut w.bad_status),
+            s403: std::mem::take(&mut w.s403),
+            s405: std::mem::take(&mut w.s405),
             ..Default::default()
         };
-        let fresh = WindowDelta {
-            win_lat: vec![0; self.lat_cfg.n_buckets()],
-            ..Default::default()
-        };
-        *w = fresh;
-        wt
+        let win_lat = std::mem::replace(&mut w.win_lat, vec![0; self.lat_cfg.n_buckets()]);
+        (wt, win_lat)
     }
 
-    /// Merged window p99 across nodes.
-    pub fn window_p99_ns(&self) -> f64 {
-        let w = self.window.lock().unwrap();
-        let agg = Agg {
-            cfg: self.lat_cfg,
-            counts: w.win_lat.clone(),
-            total: w.win_lat.iter().sum(),
+    /// Merged cumulative view for the coordinator's display bus (TUI/web).
+    /// Cheap: clones bucket vecs and maps; called at 100ms cadence.
+    pub fn merged_display(&self) -> MergedDisplay {
+        let buckets = self.lat_cfg.n_buckets();
+        let g = self.inner.lock().unwrap();
+        let mut d = MergedDisplay {
+            lat_counts: vec![0; buckets],
+            lag_counts: vec![0; buckets],
+            ..Default::default()
         };
-        agg.quantile(0.99).unwrap_or(0) as f64
+        let mut statuses: HashMap<u16, u64> = HashMap::new();
+        let mut errors: HashMap<ErrorKind, u64> = HashMap::new();
+        for slot in g.nodes.values() {
+            if slot.lat_cum.len() == buckets {
+                for (i, c) in slot.lat_cum.iter().enumerate() {
+                    d.lat_counts[i] += c;
+                }
+            }
+            if slot.lag_cum.len() == buckets {
+                for (i, c) in slot.lag_cum.iter().enumerate() {
+                    d.lag_counts[i] += c;
+                }
+            }
+            for (c, n) in &slot.statuses {
+                *statuses.entry(*c).or_default() += n;
+            }
+            for (k, n) in &slot.errors {
+                *errors.entry(*k).or_default() += n;
+            }
+            d.count_total += slot.count_total;
+            d.dispatched += slot.dispatched;
+            d.in_flight += slot.in_flight;
+            d.bytes_in += slot.bytes_in;
+            d.bytes_out += slot.bytes_out;
+            d.ws_held += slot.ws_held;
+        }
+        d.statuses = statuses.into_iter().collect();
+        d.errors = errors.into_iter().collect();
+        d
     }
 
     /// Final merged cumulative state for the report: (lat, lag, statuses,

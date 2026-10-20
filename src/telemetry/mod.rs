@@ -97,6 +97,8 @@ pub struct Snapshot {
     pub scheduler_lag_p99_ns: u64,
     pub ws_held: u64,
     pub strategy: String,
+    /// Fleet size backing this snapshot (1 = single-node local run).
+    pub nodes: u32,
     pub history: Vec<HistPoint>,
 }
 
@@ -129,6 +131,7 @@ impl Snapshot {
             scheduler_lag_p99_ns: 0,
             ws_held: 0,
             strategy: "starting".into(),
+            nodes: 1,
             history: vec![],
         }
     }
@@ -144,6 +147,31 @@ pub struct TickData {
     pub lat_window: Vec<u64>,
     pub lag_window: Vec<u64>,
     pub window: WindowTotals,
+    /// Real-time span the window covers. Local runs: TICK_MS. The swarm
+    /// display bus passes the true drain-to-drain interval — poll deltas
+    /// arrive in ~500ms chunks, and rps math must not assume 100ms windows.
+    pub window_ms: u64,
+}
+
+/// One merged fleet tick for the swarm display bus (`Telemetry::swarm_tick`).
+pub struct SwarmTick {
+    /// Merged 100ms window totals (count/errors/bad_status across nodes).
+    pub window: WindowTotals,
+    /// Merged window latency buckets (drives window p99 + derivative).
+    pub win_lat_buckets: Vec<u64>,
+    /// Merged cumulative latency/lag histogram buckets across the fleet.
+    pub cum_lat_counts: Vec<u64>,
+    pub cum_lag_counts: Vec<u64>,
+    pub status_map: Vec<(u16, u64)>,
+    pub error_map: Vec<(ErrorKind, u64)>,
+    pub count_total: u64,
+    pub dispatched: u64,
+    pub in_flight: u64,
+    pub bytes_in: u64,
+    pub bytes_out: u64,
+    pub ws_held: u64,
+    /// True real-time span of the window (drain-to-drain).
+    pub window_ms: u64,
 }
 
 /// Central telemetry recorder + 100ms tick aggregator.
@@ -154,7 +182,7 @@ pub struct Telemetry {
     cum: Mutex<Cum>,
     cls: ClassifierState,
     total_count: AtomicU64,
-    window_ring: Mutex<VecDeque<u64>>,
+    window_ring: Mutex<VecDeque<(u64, u64)>>,
     bytes_in: AtomicU64,
     bytes_out: AtomicU64,
     ws_held: AtomicI64,
@@ -162,6 +190,9 @@ pub struct Telemetry {
     dispatched: AtomicU64,
     target_rate: AtomicU64,
     strategy_label: Mutex<String>,
+    /// Fleet size this bus displays (1 = single-node local run; the swarm
+    /// coordinator sets it to the node count).
+    fleet_nodes: std::sync::atomic::AtomicU32,
     deriv: Mutex<Deriv>,
     history: Mutex<VecDeque<HistPoint>>,
     tx: watch::Sender<Snapshot>,
@@ -196,6 +227,7 @@ impl Telemetry {
             dispatched: AtomicU64::new(0),
             target_rate: AtomicU64::new(0),
             strategy_label: Mutex::new("starting".into()),
+            fleet_nodes: std::sync::atomic::AtomicU32::new(1),
             deriv: Mutex::new(Deriv::new(6)),
             history: Mutex::new(VecDeque::with_capacity(241)),
             tx,
@@ -240,6 +272,11 @@ impl Telemetry {
     }
     pub fn set_strategy_label(&self, s: impl Into<String>) {
         *self.strategy_label.lock().unwrap() = s.into();
+    }
+    /// Set the fleet size shown in snapshots (swarm display bus).
+    pub fn set_fleet_nodes(&self, n: u32) {
+        self.fleet_nodes
+            .store(n.max(1), std::sync::atomic::Ordering::Relaxed);
     }
     pub fn target_rate(&self) -> f64 {
         self.target_rate.load(Ordering::Relaxed) as f64
@@ -291,6 +328,7 @@ impl Telemetry {
             lat_window,
             lag_window,
             window,
+            window_ms: TICK_MS,
         }
     }
 
@@ -328,15 +366,20 @@ impl Telemetry {
         let bytes_in_total = self.bytes_in.load(Ordering::Relaxed);
         let ws_held = self.ws_held();
 
-        // 1s RPS: mean of the last up-to-10 window counts.
+        // 1s RPS: mean of the last up-to-10 window counts, scaled by each
+        // window's true duration (swarm windows arrive in poll-sized chunks).
         let actual_rps = {
             let mut g = self.window_ring.lock().unwrap();
-            g.push_back(td.window.count);
+            g.push_back((td.window.count, td.window_ms));
             if g.len() > 10 {
                 g.pop_front();
             }
-            let len = g.len().max(1);
-            g.iter().sum::<u64>() as f64 * (10.0 / len as f64)
+            let (sum, ms) = g.iter().fold((0u64, 0u64), |(s, m), (c, w)| (s + c, m + w));
+            if ms > 0 {
+                sum as f64 * 1000.0 / ms as f64
+            } else {
+                0.0
+            }
         };
 
         // Window p99 straight from the freshly drained window counts.
@@ -388,7 +431,11 @@ impl Telemetry {
             h.push_back(HistPoint {
                 ms: tick_ms,
                 p99_ns: window_p99 as u64,
-                rps: td.window.count as f64 * 10.0,
+                rps: if td.window_ms > 0 {
+                    td.window.count as f64 * 1000.0 / td.window_ms as f64
+                } else {
+                    0.0
+                },
                 err_pct: err_pct_window,
             });
             while h.len() > 240 {
@@ -430,10 +477,55 @@ impl Telemetry {
             scheduler_lag_p99_ns: cum_lag.quantile(0.99).unwrap_or(0),
             ws_held,
             strategy: self.strategy_label.lock().unwrap().clone(),
+            nodes: self.fleet_nodes.load(std::sync::atomic::Ordering::Relaxed),
             history,
         };
         self.tx.send_replace(snap.clone());
         snap
+    }
+
+    /// Swarm display tick: the coordinator mirrors one merged fleet window +
+    /// the merged cumulative state into this bus so the stock TUI/web UIs
+    /// render fleet-aggregate telemetry unchanged. Windows arrive from the
+    /// MergeStore (nodes report cumulative buckets; deltas are derived by
+    /// subtraction), so nothing is recorded locally.
+    pub fn swarm_tick(&self, m: SwarmTick) -> Snapshot {
+        // Replace cumulative aggregates with merged fleet buckets.
+        {
+            let mut cum = self.cum.lock().unwrap();
+            let mut lat = Agg::empty(cum.lat.cfg);
+            lat.counts = m.cum_lat_counts;
+            lat.total = lat.counts.iter().sum();
+            let mut lag = Agg::empty(cum.lag.cfg);
+            lag.counts = m.cum_lag_counts;
+            lag.total = lag.counts.iter().sum();
+            cum.lat = lat;
+            cum.lag = lag;
+        }
+        self.cls.replace_totals(&m.status_map, &m.error_map);
+        self.total_count.store(m.count_total, Ordering::Relaxed);
+        self.dispatched.store(m.dispatched, Ordering::Relaxed);
+        self.in_flight.store(m.in_flight as i64, Ordering::Relaxed);
+        self.bytes_in.store(m.bytes_in, Ordering::Relaxed);
+        self.bytes_out.store(m.bytes_out, Ordering::Relaxed);
+        self.ws_held.store(m.ws_held as i64, Ordering::Relaxed);
+
+        // The MergeStore tracks latency window deltas only; scheduler-lag
+        // windows don't exist fleet-side. Normalize both windows to the
+        // replaced cumulative's width so `finish_tick`'s bucket-add invariant
+        // holds for any caller (short/empty vecs = zero window).
+        let (lat_width, lag_width) = {
+            let cum = self.cum.lock().unwrap();
+            (cum.lat.counts.len(), cum.lag.counts.len())
+        };
+        let mut lat_window = m.win_lat_buckets;
+        lat_window.resize(lat_width, 0);
+        self.finish_tick(TickData {
+            lat_window,
+            lag_window: vec![0; lag_width],
+            window: m.window,
+            window_ms: m.window_ms,
+        })
     }
 
     /// Final aggregate of the whole run (cumulative + any post-tick stragglers).
@@ -591,5 +683,77 @@ mod tests {
         let snap = t.finish_tick(t.begin_tick());
         assert_eq!(snap.trend, Trend::Idle);
         assert_eq!(snap.count_total, 0);
+    }
+
+    #[tokio::test]
+    async fn swarm_tick_mirrors_merged_state() {
+        use crate::telemetry::histogram::AtomicHdr;
+        let t = Telemetry::new();
+        t.set_fleet_nodes(3);
+        // Simulate a merged fleet: 10 completed requests at ~20ms in the
+        // cumulative + window buckets, 200s only.
+        let h = AtomicHdr::new(LAT_MIN_NS, LAT_MAX_NS);
+        for _ in 0..10 {
+            h.record(20_000_000);
+        }
+        let buckets = h.drain();
+        let window = WindowTotals {
+            count: 10,
+            errors: 0,
+            bad_status: 0,
+            ..Default::default()
+        };
+        t.set_strategy_label("Knee · fleet 3 nodes");
+        let snap = t.swarm_tick(SwarmTick {
+            window,
+            win_lat_buckets: buckets.clone(),
+            cum_lat_counts: buckets,
+            cum_lag_counts: vec![0; HdrConfig::new(LAT_MIN_NS, LAT_MAX_NS).n_buckets()],
+            status_map: vec![(200, 10)],
+            error_map: vec![],
+            count_total: 10,
+            dispatched: 12,
+            in_flight: 2,
+            bytes_in: 1_000,
+            bytes_out: 500,
+            ws_held: 4,
+            window_ms: 100,
+        });
+        assert_eq!(snap.nodes, 3);
+        assert_eq!(snap.count_total, 10);
+        assert_eq!(snap.count_window, 10);
+        assert_eq!(snap.dispatched, 12);
+        assert_eq!(snap.in_flight, 2);
+        assert_eq!(snap.ws_held, 4);
+        assert_eq!(snap.statuses, vec![(200, 10, 100.0)]);
+        assert!(snap.errors.is_empty());
+        assert!(snap.p50_ns >= 19_000_000, "p50 {}", snap.p50_ns);
+        assert!(
+            (snap.actual_rps - 100.0).abs() < 5.0,
+            "rps {}",
+            snap.actual_rps
+        );
+        assert_eq!(snap.strategy, "Knee · fleet 3 nodes");
+        assert_eq!(snap.history.len(), 1);
+        // The bus is replace-per-tick: a zeroed tick reports zero totals.
+        let mut zero_buckets = vec![0u64; HdrConfig::new(LAT_MIN_NS, LAT_MAX_NS).n_buckets()];
+        zero_buckets[5] = 0;
+        let snap2 = t.swarm_tick(SwarmTick {
+            window: WindowTotals::default(),
+            win_lat_buckets: zero_buckets.clone(),
+            cum_lat_counts: zero_buckets,
+            cum_lag_counts: vec![0; HdrConfig::new(LAT_MIN_NS, LAT_MAX_NS).n_buckets()],
+            status_map: vec![(200, 10)],
+            error_map: vec![],
+            count_total: 10,
+            dispatched: 12,
+            in_flight: 0,
+            bytes_in: 1_000,
+            bytes_out: 500,
+            ws_held: 0,
+            window_ms: 100,
+        });
+        assert_eq!(snap2.count_window, 0);
+        assert_eq!(snap2.trend, Trend::Stable);
     }
 }

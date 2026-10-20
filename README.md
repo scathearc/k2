@@ -147,6 +147,10 @@ k2 --swarm-provision k2-node
 # Fan a campaign out across N sandboxes; the coordinator runs the closed
 # loop over merged fleet telemetry and commands rate/N to each node
 E2B_API_KEY=... k2 https://target.app/api --swarm 8 --rate 2000 -d 30 --json
+
+# Same, but watch the FLEET AGGREGATE live (coordinator-side; nodes stay headless)
+E2B_API_KEY=... k2 https://target.app/api --swarm 8 --rate 2000 -d 30 --tui
+E2B_API_KEY=... k2 https://target.app/api --swarm 8 --rate 2000 -d 30 --web 127.0.0.1:9600
 ```
 
 The point is **sustained pressure**, not aggregate RPS: per-source-IP edge
@@ -155,6 +159,13 @@ N concurrent sources each below the per-IP ceiling keep the campaign working
 past the adaptation, and the status-first controller proves the target is
 still visible (`403/405/5xx` = blocked; latency noise never throttles the
 loop). Nodes can also route through `--proxy` residential exits.
+
+The coordinator exposes the stock TUI and web dashboard against the
+**merged fleet view**: every 100ms it mirrors the aggregated windows,
+cumulative histograms, status/error maps and per-node counters into a
+display bus, so the TUI header shows `FLEET: ×N` and hotkeys / web
+controls command the whole fleet (strategy + rate are coordinator-owned;
+[E] entropy applies to newly configured nodes only).
 
 ## Known limitations
 
